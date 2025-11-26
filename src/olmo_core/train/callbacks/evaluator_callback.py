@@ -29,6 +29,7 @@ from olmo_core.utils import (
 
 from ..common import Duration, MetricMergeStrategy
 from ..train_module import EvalBatchSizeUnit, EvalBatchSpec, TransformerTrainModule
+from ..train_module.transformer.sam_train_module import TransformerSAMTrainModule
 from .callback import Callback, CallbackConfig
 
 if TYPE_CHECKING:
@@ -43,6 +44,7 @@ log = logging.getLogger(__name__)
 class EvaluatorCallback(Callback):
     """
     Runs in-loop evaluations for a :class:`~olmo_core.train.train_module.TransformerTrainModule`
+    or :class:`~olmo_core.train.train_module.transformer.sam_train_module.TransformerSAMTrainModule`
     periodically during training.
     """
 
@@ -79,9 +81,9 @@ class EvaluatorCallback(Callback):
     """
 
     def post_attach(self):
-        if not isinstance(self.trainer.train_module, TransformerTrainModule):
+        if not isinstance(self.trainer.train_module, (TransformerTrainModule, TransformerSAMTrainModule)):
             raise OLMoConfigurationError(
-                f"'{self.__class__.__name__}' only suports the '{TransformerTrainModule.__name__}' train module"
+                f"'{self.__class__.__name__}' requires a transformer-compatible train module"
             )
 
     def pre_train(self):

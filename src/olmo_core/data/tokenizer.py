@@ -41,17 +41,17 @@ class TokenizerConfig(Config):
     A configuration class that represents a tokenizer.
     """
 
-    vocab_size: int
+    vocab_size: Optional[int] = None
     """
     The vocab size.
     """
 
-    eos_token_id: int
+    eos_token_id: Optional[int] = None
     """
     The end-of-sentence token ID.
     """
 
-    pad_token_id: int
+    pad_token_id: Optional[int] = None
     """
     The padding token ID.
     """
@@ -66,11 +66,68 @@ class TokenizerConfig(Config):
     The identifier of the tokenizer. Could be a path or HuggingFace identifier.
     """
 
+    def __post_init__(self):
+        """
+        Allow specifying only the identifier (or TokenizerName) and infer the numeric fields.
+        """
+        # Already complete
+        if self.vocab_size is not None and self.eos_token_id is not None and self.pad_token_id is not None:
+            return
+
+        if self.identifier is None:
+            # Nothing to infer from
+            return
+
+        ident = str(self.identifier)
+        name = None
+        try:
+            name = TokenizerName(ident)
+        except Exception:
+            name = None
+
+        inferred: Optional["TokenizerConfig"] = None
+        if name is not None:
+            if name == TokenizerName.gpt2:
+                inferred = TokenizerConfig.gpt2()
+            elif name == TokenizerName.dolma2:
+                inferred = TokenizerConfig.dolma2()
+            elif name == TokenizerName.dolma2_sigdig:
+                inferred = TokenizerConfig.dolma2_sigdig()
+            elif name == TokenizerName.gpt_neox_olmo_dolma_v1_5:
+                inferred = TokenizerConfig.gpt_neox_olmo_dolma_v1_5()
+        else:
+            # Try to map common aliases
+            if ident == "gpt2":
+                inferred = TokenizerConfig.gpt2()
+            elif "dolma2-tokenizer-sigdig" in ident:
+                inferred = TokenizerConfig.dolma2_sigdig()
+            elif "dolma2-tokenizer" in ident:
+                inferred = TokenizerConfig.dolma2()
+            elif "gpt-neox-olmo-dolma-v1_5" in ident:
+                inferred = TokenizerConfig.gpt_neox_olmo_dolma_v1_5()
+            else:
+                # Fall back to HF config if available
+                try:
+                    inferred = TokenizerConfig.from_hf(ident)
+                except Exception:
+                    inferred = None
+
+        if inferred is not None:
+            # Preserve identifier given by user; copy numeric fields
+            self.vocab_size = inferred.vocab_size
+            self.eos_token_id = inferred.eos_token_id
+            self.pad_token_id = inferred.pad_token_id
+            # Only set bos if not specified
+            if self.bos_token_id is None:
+                self.bos_token_id = inferred.bos_token_id
+
     def padded_vocab_size(self, pad_multiple: int = 128) -> int:
         """
         Returns the vocab size padded to be a multiple of ``pad_multiple``.
         This is useful to set model embeddings to this number to increase throughput.
         """
+        if self.vocab_size is None:
+            raise ValueError("vocab_size is not set on TokenizerConfig")
         return pad_multiple * ((self.vocab_size + pad_multiple - 1) // pad_multiple)
 
     @classmethod

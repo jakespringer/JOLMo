@@ -268,6 +268,19 @@ class CheckpointerCallback(Callback):
             return
 
         if self.step > self._latest_checkpoint_step:
-            self._checkpoints.append(self._save_checkpoint(save_async=False))
+            # Ensure any pending async checkpoint is finalized before writing the final checkpoint.
+            self._await_last_checkpoint()
+            final_path = join_path(self.save_folder, self.checkpointer.FINAL_DIR)
+            log.info(f"Saving final checkpoint to '{final_path}'...")
+            self.trainer.checkpointer.save(
+                final_path, self.trainer.train_module, self.trainer.state_dict()
+            )
+            # Notify callbacks that a checkpoint was saved.
+            for callback in self.trainer._iter_callbacks():
+                callback.post_checkpoint_saved(final_path)
+            log.info("Final checkpoint saved")
+            self._latest_checkpoint_step = self.step
+            self._latest_checkpoint_path = str(final_path)
+            self._checkpoints.append(str(final_path))
 
         self._await_last_checkpoint()

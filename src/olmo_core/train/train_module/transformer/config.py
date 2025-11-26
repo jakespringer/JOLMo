@@ -353,3 +353,42 @@ class TransformerPipelineTrainModuleConfig(TransformerTrainModuleConfig):
     def __post_init__(self):
         if self.pp_config is None:
             raise OLMoConfigurationError("'pp_config' is required")
+
+
+@dataclass
+class TransformerSAMConfig(Config):
+    """
+    A configuration class for building :class:`TransformerSAMTrainModule` instances.
+    """
+
+    rho: float = 0.05
+    """
+    Perturbation radius for the SAM ascent step.
+    """
+
+    m: Optional[int] = None
+    """
+    Number of ascent directions (ideally equals DP world size). If None, inferred from DP world size.
+    """
+
+    eps: float = 1e-12
+    """
+    Numerical stability constant to avoid divide-by-zero when normalizing gradients.
+    """
+
+    normalization: str = "global"
+    """
+    Normalization mode for the SAM ascent step. One of: "none", "global", "layer".
+    """
+
+    sam_parameter_types: Optional[str] = None
+    """
+    Comma-separated list of module class names (e.g., "Linear,Conv1d") that should
+    receive SAM perturbations. If None or empty, applies to all parameters.
+    """
+
+    def __post_init__(self):
+        if self.normalization not in {"none", "global", "layer"}:
+            raise OLMoConfigurationError(
+                f"Invalid SAM normalization '{self.normalization}'. Expected one of: 'none', 'global', 'layer'"
+            )

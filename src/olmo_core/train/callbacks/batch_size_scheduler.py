@@ -12,6 +12,7 @@ from olmo_core.optim.scheduler import WSD, ConstantScheduler, Scheduler
 
 from ..common import Duration
 from ..train_module import TransformerPipelineTrainModule, TransformerTrainModule
+from ..train_module.transformer.sam_train_module import TransformerSAMTrainModule
 from .callback import Callback
 from .speed_monitor import SpeedMonitorCallback
 
@@ -91,6 +92,8 @@ class BatchSizeSchedulerCallback(Callback):
         scheduler: Optional[Scheduler] = None
         if isinstance(self.trainer.train_module, TransformerTrainModule):
             scheduler = self.trainer.train_module.scheduler
+        elif isinstance(self.trainer.train_module, TransformerSAMTrainModule):
+            scheduler = self.trainer.train_module.scheduler
         elif isinstance(self.trainer.train_module, TransformerPipelineTrainModule):
             scheduler = self.trainer.train_module.scheduler
 
@@ -159,6 +162,9 @@ class BatchSizeSchedulerCallback(Callback):
         optimizers: Optional[List[torch.optim.Optimizer]] = None
         scheduler: Optional[Scheduler] = None
         if isinstance(self.trainer.train_module, TransformerTrainModule):
+            optimizers = [self.trainer.train_module.optim]
+            scheduler = self.trainer.train_module.scheduler
+        elif isinstance(self.trainer.train_module, TransformerSAMTrainModule):
             optimizers = [self.trainer.train_module.optim]
             scheduler = self.trainer.train_module.scheduler
         elif isinstance(self.trainer.train_module, TransformerPipelineTrainModule):

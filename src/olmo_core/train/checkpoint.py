@@ -80,6 +80,7 @@ class Checkpointer:
 
     METADATA_FNAME: ClassVar[str] = ".metadata.json"
     CHECKPOINT_DIR: ClassVar[str] = "step{step}"
+    FINAL_DIR: ClassVar[str] = "final"
 
     work_dir: Path
     save_overwrite: bool = False
@@ -307,6 +308,15 @@ class Checkpointer:
         if cls.dir_is_checkpoint(dir):
             return True
 
+        # Prefer explicit 'final' checkpoint if present.
+        try:
+            final_dir = f"{normalize_path(dir)}/{cls.FINAL_DIR}"
+            if cls.dir_is_checkpoint(final_dir):
+                return True
+        except FileNotFoundError:
+            # If directory doesn't exist or is unreachable, fall through.
+            pass
+
         try:
             next(cls.find_checkpoints(dir))
             return True
@@ -321,6 +331,16 @@ class Checkpointer:
         :raises FileNotFoundError: If no checkpoints are found.
         """
         dir = normalize_path(dir)
+
+        # If a 'final' checkpoint exists, it is always considered the latest.
+        final_dir = f"{dir}/{cls.FINAL_DIR}"
+        try:
+            if cls.dir_is_checkpoint(final_dir):
+                return final_dir
+        except FileNotFoundError:
+            # If directory doesn't exist or is unreachable, fall through.
+            pass
+
         latest_step: Optional[int] = None
         latest_checkpoint: Optional[str] = None
         for step, path in cls.find_checkpoints(dir):

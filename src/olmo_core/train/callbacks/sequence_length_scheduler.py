@@ -9,6 +9,7 @@ from olmo_core.exceptions import OLMoConfigurationError
 from olmo_core.utils import gc_cuda
 
 from ..train_module import TransformerTrainModule
+from ..train_module.transformer.sam_train_module import TransformerSAMTrainModule
 from .callback import Callback
 
 log = logging.getLogger(__name__)
@@ -59,9 +60,9 @@ class SequenceLengthSchedulerCallback(Callback):
                 "The sequence length scheduler callback requires a 'NumpyFSLDataLoader', "
                 f"got '{type(self.trainer.data_loader)}' instead"
             )
-        if not isinstance(self.trainer.train_module, TransformerTrainModule):
+        if not isinstance(self.trainer.train_module, (TransformerTrainModule, TransformerSAMTrainModule)):
             raise OLMoConfigurationError(
-                "The sequence length scheduler callback requires a 'TransformerTrainModule', "
+                "The sequence length scheduler callback requires a transformer-compatible train module, "
                 f"got '{type(self.trainer.train_module)}' instead"
             )
 
@@ -93,7 +94,7 @@ class SequenceLengthSchedulerCallback(Callback):
         assert isinstance(self.trainer.data_loader, NumpyFSLDataLoader)
         dataset = self.trainer.data_loader.dataset
         assert isinstance(dataset, NumpyFSLDataset)
-        assert isinstance(self.trainer.train_module, TransformerTrainModule)
+        assert isinstance(self.trainer.train_module, (TransformerTrainModule, TransformerSAMTrainModule))
 
         new_seq_len: int
         if self.truncate:
@@ -142,7 +143,7 @@ class SequenceLengthSchedulerCallback(Callback):
         if not self.enabled or self.step > self.warmup_steps + 1:
             return
 
-        assert isinstance(self.trainer.train_module, TransformerTrainModule)
+        assert isinstance(self.trainer.train_module, (TransformerTrainModule, TransformerSAMTrainModule))
         assert self._og_rank_microbatch_size is not None
         self.trainer.train_module.rank_microbatch_size = self._og_rank_microbatch_size
 

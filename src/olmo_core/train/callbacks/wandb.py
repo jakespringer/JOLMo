@@ -70,6 +70,16 @@ class WandBCallback(Callback):
     The config to load to W&B.
     """
 
+    id: Optional[str] = None
+    """
+    Optional fixed W&B run id for resuming/continuing runs.
+    """
+
+    resume: Optional[str] = None
+    """
+    W&B resume policy, e.g., \"allow\" or \"must\". Ignored if 'id' is not set.
+    """
+
     cancel_tags: Optional[List[str]] = field(
         default_factory=lambda: ["cancel", "canceled", "cancelled"]
     )
@@ -106,12 +116,12 @@ class WandBCallback(Callback):
     def pre_train(self):
         if self.enabled and get_rank() == 0:
             if WANDB_API_KEY_ENV_VAR not in os.environ:
-                raise OLMoEnvironmentError(f"missing env var '{WANDB_API_KEY_ENV_VAR}'")
+                raise OLMoEnvironmentError(f"Missing environment variable '{WANDB_API_KEY_ENV_VAR}'")
 
             self.wandb
             wandb_dir = self.trainer.work_dir / "wandb"
             wandb_dir.mkdir(parents=True, exist_ok=True)
-            self.wandb.init(
+            init_kwargs: Dict[str, Any] = dict(
                 dir=wandb_dir,
                 project=self.project,
                 entity=self.entity,
@@ -121,6 +131,12 @@ class WandBCallback(Callback):
                 notes=self.notes,
                 config=self.config,
             )
+            # Only pass id/resume if an id was provided, to avoid implicit resume behavior.
+            if self.id is not None:
+                init_kwargs["id"] = self.id
+                if self.resume is not None:
+                    init_kwargs["resume"] = self.resume
+            self.wandb.init(**init_kwargs)
             self._run_path = self.run.path  # type: ignore
 
     def log_metrics(self, step: int, metrics: Dict[str, float]):

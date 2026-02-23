@@ -186,6 +186,15 @@ class Trainer:
     if it exists in the checkpoint, but will not error if it doesn't.
     """
 
+    load_data_loader_state: Optional[bool] = None
+    """
+    Whether to load the data loader state (batches processed, tokens processed, epoch, seed)
+    when loading trainer state from a checkpoint. If ``None``, data loader state is loaded
+    whenever trainer state is loaded. Set to ``False`` to load trainer state (global step,
+    tokens seen, etc.) without restoring data loader position, which is useful when continuing
+    training on a different dataset.
+    """
+
     metrics_collect_interval: int = 5
     """
     How often (in steps) to collect, reduce, and pass on metrics to the
@@ -752,30 +761,37 @@ class Trainer:
             "callbacks": {k: cb.state_dict() for k, cb in self.callbacks.items()},
         }
 
-    def load_state_dict(self, state_dict: TrainerStateDict):
+    def load_state_dict(self, state_dict: TrainerStateDict, load_data_loader_state: bool = True):
         """
         Load trainer state (not model or optimizer state).
-        """
-        # For backwards compatibility.
-        if "data_loader" not in state_dict:
-            if "dataset" in state_dict:
-                state_dict["data_loader"] = state_dict.pop("dataset")
-                state_dict["data_loader"]["epoch"] = state_dict["epoch"]
-            else:
-                state_dict["data_loader"] = {
-                    "dataset_type": "fsl",
-                    "dataset_fingerprint_version": state_dict.pop("dataset_fingerprint_version"),
-                    "dataset_fingerprint": state_dict.pop("dataset_fingerprint"),
-                    "tokens_processed": state_dict["global_train_tokens_seen_this_epoch"],
-                    "batches_processed": state_dict["global_train_tokens_seen_this_epoch"]
-                    // self.global_batch_size,
-                    "sequence_length": state_dict.pop("train_sequence_length"),
-                    "max_target_sequence_length": state_dict.pop("max_train_sequence_length"),
-                    "seed": state_dict["data_seed"],
-                    "epoch": state_dict["epoch"],
-                }
 
-        self.data_loader.load_state_dict(state_dict["data_loader"])
+        :param load_data_loader_state: Whether to restore data loader state (batches processed,
+            tokens processed, epoch, seed). Set to ``False`` when continuing training on a
+            different dataset while preserving the training step, tokens seen, and LR schedule.
+        """
+        if load_data_loader_state:
+            # For backwards compatibility.
+            if "data_loader" not in state_dict:
+                if "dataset" in state_dict:
+                    state_dict["data_loader"] = state_dict.pop("dataset")
+                    state_dict["data_loader"]["epoch"] = state_dict["epoch"]
+                else:
+                    state_dict["data_loader"] = {
+                        "dataset_type": "fsl",
+                        "dataset_fingerprint_version": state_dict.pop("dataset_fingerprint_version"),
+                        "dataset_fingerprint": state_dict.pop("dataset_fingerprint"),
+                        "tokens_processed": state_dict["global_train_tokens_seen_this_epoch"],
+                        "batches_processed": state_dict["global_train_tokens_seen_this_epoch"]
+                        // self.global_batch_size,
+                        "sequence_length": state_dict.pop("train_sequence_length"),
+                        "max_target_sequence_length": state_dict.pop("max_train_sequence_length"),
+                        "seed": state_dict["data_seed"],
+                        "epoch": state_dict["epoch"],
+                    }
+
+            self.data_loader.load_state_dict(state_dict["data_loader"])
+        else:
+            log.info("Skipping data loader state restoration (load_data_loader_state=False)")
         self.global_step = state_dict["global_step"]
         self.global_train_tokens_seen = state_dict["global_train_tokens_seen"]
         self.epoch = state_dict["epoch"]
@@ -804,6 +820,7 @@ class Trainer:
         *,
         load_trainer_state: Optional[bool] = None,
         load_optim_state: Optional[bool] = None,
+        load_data_loader_state: Optional[bool] = None,
     ):
         """
         Load a checkpoint.
@@ -814,11 +831,17 @@ class Trainer:
         :param dir: The path/URL to a checkpoint or a folder of checkpoints.
         :param load_trainer_state: Load trainer state (data loader state, RNG states, and other bookkeeping).
         :param load_optim_state: Load optimizer state in the train module.
+        :param load_data_loader_state: Whether to load data loader state when loading trainer state.
+            Set to ``False`` to skip restoring data loader position, which is useful when continuing
+            training on a different dataset. Defaults to ``True`` when trainer state is loaded.
         """
         load_trainer_state = (
             self.load_trainer_state if load_trainer_state is None else load_trainer_state
         )
         load_optim_state = self.load_optim_state if load_optim_state is None else load_optim_state
+        load_data_loader_state = (
+            self.load_data_loader_state if load_data_loader_state is None else load_data_loader_state
+        )
         if dir == self.save_folder:
             if load_trainer_state is False:
                 log.warning(
@@ -848,7 +871,10 @@ class Trainer:
             load_optim_state=load_optim_state,
         )
         if trainer_state is not None:
-            self.load_state_dict(cast(TrainerStateDict, trainer_state))
+            self.load_state_dict(
+                cast(TrainerStateDict, trainer_state),
+                load_data_loader_state=load_data_loader_state if load_data_loader_state is not None else True,
+            )
 
         for callback in self._iter_callbacks():
             callback.post_checkpoint_loaded(dir)
@@ -862,6 +888,7 @@ class Trainer:
         *,
         load_trainer_state: Optional[bool] = None,
         load_optim_state: Optional[bool] = None,
+        load_data_loader_state: Optional[bool] = None,
     ) -> bool:
         """
         Like :meth:`load_checkpoint()` but is a no-op if there is no checkpoint in the ``dir`` provided.
@@ -882,6 +909,7 @@ class Trainer:
                 dir,
                 load_trainer_state=load_trainer_state,
                 load_optim_state=load_optim_state,
+                load_data_loader_state=load_data_loader_state,
             )
             assert self.checkpoint_loaded
             return True

@@ -38,6 +38,7 @@ class TrainerConfig(Config):
     load_strategy: LoadStrategy = LoadStrategy.if_available
     load_optim_state: Optional[bool] = None
     load_trainer_state: Optional[bool] = None
+    load_data_loader_state: Optional[bool] = None
     checkpointer: CheckpointerConfig = field(default_factory=CheckpointerConfig)
 
     device: Optional[str] = None

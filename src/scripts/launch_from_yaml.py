@@ -70,6 +70,9 @@ class YamlExperimentConfig(Config):
 
     init_seed: int = 12536
     load_path: Optional[str] = None
+    load_optim_state: Optional[bool] = None
+    load_trainer_state: Optional[bool] = None
+    load_data_loader_state: Optional[bool] = None
     n_tokens: Optional[int] = None
 
 
@@ -295,8 +298,20 @@ def main():
     if not trainer.no_checkpoints:
         loaded = trainer.maybe_load_checkpoint()
     if not loaded and cfg.load_path:
-        log.info(f"Loading checkpoint from '{cfg.load_path}' to initialize weights only...")
-        trainer.load_checkpoint(cfg.load_path, load_trainer_state=False, load_optim_state=False)
+        load_optim = cfg.load_optim_state if cfg.load_optim_state is not None else False
+        load_trainer = cfg.load_trainer_state if cfg.load_trainer_state is not None else False
+        load_data_loader = cfg.load_data_loader_state if cfg.load_data_loader_state is not None else True
+        log.info(
+            f"Loading checkpoint from '{cfg.load_path}' "
+            f"(load_trainer_state={load_trainer}, load_optim_state={load_optim}, "
+            f"load_data_loader_state={load_data_loader})..."
+        )
+        trainer.load_checkpoint(
+            cfg.load_path,
+            load_trainer_state=load_trainer,
+            load_optim_state=load_optim,
+            load_data_loader_state=load_data_loader,
+        )
 
     trainer.fit()
 

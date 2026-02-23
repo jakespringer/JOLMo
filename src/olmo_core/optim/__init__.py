@@ -2,6 +2,7 @@ from .adam import AdamConfig
 from .adamw import AdamWConfig, SkipStepAdamW, SkipStepAdamWConfig
 from .config import INITIAL_LR_FIELD, LR_FIELD, OptimConfig, OptimGroupOverride
 from .lion import Lion, LionConfig, SkipStepLion, SkipStepLionConfig
+from .muon import Muon, MuonConfig
 from .noop import NoOpConfig, NoOpOptimizer
 from .scheduler import (
     WSD,
@@ -30,6 +31,8 @@ __all__ = [
     "Lion",
     "SkipStepLionConfig",
     "SkipStepLion",
+    "MuonConfig",
+    "Muon",
     "NoOpConfig",
     "NoOpOptimizer",
     "Scheduler",

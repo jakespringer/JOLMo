@@ -93,7 +93,10 @@ class SpeedMonitorCallback(Callback):
                     self.device_peak_flops = int(4.5e15 * dense_correction)
                 else:  # for other GPU types, assume A100
                     # data from https://www.nvidia.com/en-us/data-center/a100/
-                    self.device_peak_flops = int(312e12 * dense_correction)
+                    # A100 80GB SXM BF16: 312 TFLOPS dense, 624 TFLOPS sparse.
+                    # Use sparse spec (624e12) so the dense_correction factor applies
+                    # consistently across all GPU types.
+                    self.device_peak_flops = int(624e12 * dense_correction)
             log.info(f"Device: {device_name}, Device peak FLOPS: {self.device_peak_flops}")
 
     def pre_load_batch(self):

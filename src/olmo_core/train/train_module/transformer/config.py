@@ -368,7 +368,19 @@ class TransformerSAMConfig(Config):
 
     m: Optional[int] = None
     """
-    Number of ascent directions (ideally equals DP world size). If None, inferred from DP world size.
+    Per-GPU SAM perturbation batch size in tokens. Controls how many tokens of data
+    are used to compute each perturbation direction on each GPU.
+
+    - When ``m == device_batch_size`` (the default if None): standard SAM — one
+      perturbation per GPU per step, computed from the full device batch.
+    - When ``m < device_batch_size``: m-SAM — the device batch is split into
+      ``device_batch_size / m`` SAM groups, each getting its own independent
+      perturbation direction. Smaller m yields more fine-grained perturbations
+      and stronger implicit regularization.
+    - Must be a multiple of ``rank_microbatch_size``.
+    - Must evenly divide the device batch size (``global_batch_size / dp_world_size``).
+
+    If None, defaults to the device batch size at the start of training.
     """
 
     eps: float = 1e-12

@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import random
 from dataclasses import replace
 from functools import cached_property
 from typing import Any, Dict, Generator, Literal, Optional, Tuple, Union, Set, TYPE_CHECKING
@@ -8,6 +9,7 @@ from dataclasses import dataclass
 from importlib import import_module
 from math import cos, pi
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint.state_dict as dist_cp_sd
@@ -16,7 +18,6 @@ from torch.distributed import DeviceMesh
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.tensor import DTensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 
@@ -27,7 +28,6 @@ from olmo_core.distributed.checkpoint import (
     swap_param_keys,
 )
 from olmo_core.distributed.parallel import (
-    DataParallelType,
     build_world_mesh,
     get_dp_process_group,
 )
@@ -65,6 +65,75 @@ log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from olmo_core.train import Trainer
+
+
+# ---------------------------------------------------------------------------
+# RNG state helpers — ensure identical dropout masks between ascent and
+# descent forward passes by capturing and restoring full RNG state.
+# ---------------------------------------------------------------------------
+
+def _get_current_cuda_device() -> Optional[int]:
+    """
+    Return the CUDA device index for this process.
+    Assumes the process has already selected its device
+    (e.g. via torch.cuda.set_device(local_rank)).
+    """
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.current_device()
+
+
+def get_rng_state() -> Dict[str, Any]:
+    """
+    Capture RNG state for:
+      - Python random
+      - NumPy
+      - PyTorch CPU
+      - PyTorch CUDA on the current process's current GPU only
+    """
+    cuda_device = _get_current_cuda_device()
+
+    state: Dict[str, Any] = {
+        "python_random": random.getstate(),
+        "numpy_random": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": None,
+        "cuda_device": cuda_device,
+        "distributed_rank": dist.get_rank() if dist.is_available() and dist.is_initialized() else None,
+    }
+
+    if cuda_device is not None:
+        state["torch_cuda"] = torch.cuda.get_rng_state(cuda_device)
+
+    return state
+
+
+def set_rng_state(state: Dict[str, Any]) -> None:
+    """
+    Restore RNG state saved by get_rng_state().
+    Restores CUDA RNG state onto the current process's current GPU.
+    """
+    random.setstate(state["python_random"])
+    np.random.set_state(state["numpy_random"])
+    torch.set_rng_state(state["torch_cpu"])
+
+    saved_cuda_state = state.get("torch_cuda", None)
+    if saved_cuda_state is not None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Saved CUDA RNG state exists, but CUDA is not available now.")
+
+        current_device = _get_current_cuda_device()
+        saved_device = state.get("cuda_device", None)
+
+        if saved_device is not None and current_device != saved_device:
+            raise RuntimeError(
+                f"Current CUDA device ({current_device}) does not match "
+                f"saved CUDA device ({saved_device}). Make sure each rank "
+                f"sets its correct local device before restoring RNG state."
+            )
+
+        torch.cuda.set_rng_state(saved_cuda_state, device=current_device)
+
 
 @dataclass
 class SAMScheduler(Config, metaclass=ABCMeta):
@@ -293,6 +362,17 @@ class TransformerSAMTrainModule(TrainModule):
         )
         self._model_mode: Optional[Literal["train", "eval"]] = None
 
+        # SAM does not currently support FSDP. FSDP's gradient reduce-scatter during
+        # backward prevents independent per-GPU perturbations required for m-SAM.
+        # Use DDP (DistributedDataParallel) instead.
+        if isinstance(self.model, (FSDP, FSDPModule)):
+            raise OLMoConfigurationError(
+                "TransformerSAMTrainModule does not currently support FSDP/FSDP2. "
+                "FSDP's gradient reduce-scatter during backward prevents the independent "
+                "per-GPU gradient computation required for m-SAM. Use DDP instead by setting "
+                "dp_config to a DDP-based configuration."
+            )
+
         self._dp_config = dp_config
         self._cp_config = cp_config
         self._tp_config = tp_config
@@ -368,14 +448,46 @@ class TransformerSAMTrainModule(TrainModule):
                 f"global batch size ({self.trainer.global_batch_size:,d}) must be divisible by "
                 f"micro-batch size ({self.rank_microbatch_size:,d}) x DP world size ({dp_ws})"
             )
-        # Validate / infer m for m-SAM.
+
+        device_batch_size = self.trainer.global_batch_size // dp_ws
+
+        # Validate / infer m for SAM.
+        # m = per-GPU batch size (in tokens) used to compute each SAM perturbation.
+        #   - When m == device_batch_size: standard SAM (one perturbation per GPU per step).
+        #   - When m < device_batch_size: m-SAM — the device batch is split into
+        #     (device_batch_size / m) SAM groups, each getting its own perturbation.
+        #   - m must be a multiple of rank_microbatch_size and must evenly divide
+        #     the device batch size.
         if self.sam_config.m is None:
-            self.sam_config.m = dp_ws
-        elif self.sam_config.m != dp_ws:
+            self.sam_config.m = device_batch_size
+        m = self.sam_config.m
+        if m < self.rank_microbatch_size:
             raise OLMoConfigurationError(
-                f"For m-SAM, 'm' ({self.sam_config.m}) must equal DP world size ({dp_ws}) when "
-                "sam_micro_batch equals the device batch size"
+                f"SAM perturbation batch size m ({m:,d} tokens) must be >= "
+                f"rank_microbatch_size ({self.rank_microbatch_size:,d} tokens)"
             )
+        if m > device_batch_size:
+            raise OLMoConfigurationError(
+                f"SAM perturbation batch size m ({m:,d} tokens) must be <= "
+                f"device_batch_size ({device_batch_size:,d} tokens)"
+            )
+        if m % self.rank_microbatch_size != 0:
+            raise OLMoConfigurationError(
+                f"SAM perturbation batch size m ({m:,d} tokens) must be divisible by "
+                f"rank_microbatch_size ({self.rank_microbatch_size:,d} tokens)"
+            )
+        if device_batch_size % m != 0:
+            raise OLMoConfigurationError(
+                f"Device batch size ({device_batch_size:,d} tokens) must be divisible by "
+                f"SAM perturbation batch size m ({m:,d} tokens)"
+            )
+
+        sam_group_size = m // self.rank_microbatch_size
+        num_sam_groups = device_batch_size // m
+        log.info(
+            f"SAM config: m={m:,d} tokens, {sam_group_size} micro-batch(es) per perturbation, "
+            f"{num_sam_groups} perturbation(s) per device per step"
+        )
 
     def state_dict(self, *, optim: Optional[bool] = None) -> Dict[str, Any]:
         if optim is None:
@@ -519,8 +631,8 @@ class TransformerSAMTrainModule(TrainModule):
         )
 
         # Batch losses to record.
-        initial_ce_batch_loss = move_to_device(torch.tensor(0.0), self.device)
-        ascent_ce_batch_loss = move_to_device(torch.tensor(0.0), self.device)
+        ce_batch_loss = move_to_device(torch.tensor(0.0), self.device)
+        perturbed_ce_batch_loss = move_to_device(torch.tensor(0.0), self.device)
         z_batch_loss: Optional[torch.Tensor] = None
         if self.z_loss_multiplier is not None:
             z_batch_loss = move_to_device(torch.tensor(0.0), self.device)
@@ -533,89 +645,139 @@ class TransformerSAMTrainModule(TrainModule):
         micro_batches = split_batch(batch, self.rank_microbatch_size // seq_len)
         num_micro_batches = len(micro_batches)
 
-        # Update rho from scheduler before computing perturbation
+        # Update rho from scheduler before computing perturbation.
         if self.sam_scheduler is not None and not dry_run:
             self.sam_scheduler.set_rho(self.sam_config, self.trainer)
 
-        # m-SAM ascent: compute local gradient without DP sync and perturb parameters.
-        perturbations: Optional[list[Tuple[nn.Parameter, torch.Tensor]]] = []
-        with self._sam_no_sync_context():
-            for micro_batch_idx, micro_batch in enumerate(micro_batches):
-                # No-sync context prevents gradient reduction across ranks here.
-                input_ids, labels, model_kwargs = self._prepare_batch(micro_batch, keep_keys=True)
-                _, loss, ce_loss, _ = self.model_forward(
-                    input_ids,
-                    labels=labels,
-                    ignore_index=self.label_ignore_index,
-                    loss_reduction="sum",
-                    z_loss_multiplier=self.z_loss_multiplier,
-                    loss_div_factor=batch_num_tokens_for_loss,
-                    return_logits=False,
-                    **model_kwargs,
-                )
-                initial_ce_batch_loss += get_local_tensor(ce_loss.detach())
-                del ce_loss
-                loss.backward()
-
-        # Compute normalization scalars and apply perturbation based on config.
+        # Precompute perturbation config.
         norm_mode = (self.sam_config.normalization or "global").lower()
         rho = torch.tensor(self.sam_config.rho, device=self.device)
-        scale_global: torch.Tensor = rho
-        if norm_mode == "global":
-            gnorm = self._grad_global_norm()
-            scale_global = (rho / (gnorm + self.sam_config.eps)).to(self.device)
-        perturbations = []
-        for p in self.model.parameters():
-            if p.grad is None:
-                continue
-            if self._sam_allowed_param_ids is not None and id(p) not in self._sam_allowed_param_ids:
-                continue
-            if norm_mode == "none":
-                scale_p = rho
-            elif norm_mode == "layer":
-                p_norm = p.grad.detach().norm(2)
-                scale_p = (rho / (p_norm + self.sam_config.eps)).to(self.device)
-            elif norm_mode == "global":
-                scale_p = scale_global
-            else:
-                raise OLMoConfigurationError(f"Invalid SAM normalization mode: {norm_mode}")
-            eps_w = p.grad.detach() * scale_p.to(dtype=p.dtype)
-            p.data.add_(eps_w)
-            perturbations.append((p, eps_w))
 
-        # Train one micro-batch at a time.
-        for micro_batch_idx, micro_batch in enumerate(micro_batches):
-            with self._train_microbatch_context(micro_batch_idx, num_micro_batches):
-                input_ids, labels, model_kwargs = self._prepare_batch(micro_batch)
+        # SAM group size: how many micro-batches per SAM perturbation.
+        # m = per-GPU batch size (in tokens) for computing each perturbation.
+        assert self.sam_config.m is not None, "sam_config.m must be set before train_batch (see pre_train)"
+        sam_group_size = self.sam_config.m // self.rank_microbatch_size
+        num_sam_groups = num_micro_batches // sam_group_size
 
-                # Run forward pass, get losses.
-                _, loss, ce_loss, z_loss = self.model_forward(
-                    input_ids,
-                    labels=labels,
-                    ignore_index=self.label_ignore_index,
-                    loss_reduction="sum",
-                    z_loss_multiplier=self.z_loss_multiplier,
-                    loss_div_factor=batch_num_tokens_for_loss,
-                    return_logits=False,
-                    **model_kwargs,
-                )
+        # SAM algorithm (with optional m-sharding):
+        # For each SAM group of ``sam_group_size`` micro-batches:
+        #   1. Save RNG state and accumulated descent grads
+        #   2. ASCENT: forward+backward without DP sync over the group (accumulate
+        #      ascent gradients across micro-batches in the group)
+        #   3. Compute perturbation eps = rho * grad / ||grad|| and perturb weights
+        #   4. Restore descent grads and RNG state (so descent sees identical dropout)
+        #   5. DESCENT: forward+backward at perturbed weights (DDP all-reduce fires
+        #      only on the very last micro-batch of the entire device batch)
+        #   6. Restore original weights
+        # Descent gradients accumulate across all SAM groups. DDP all-reduce fires
+        # only on the very last micro-batch of the entire device batch.
+        descent_mb_counter = 0
+        for group_idx in range(num_sam_groups):
+            group_start = group_idx * sam_group_size
+            group_end = group_start + sam_group_size
 
-                # Update total batch CE and Z loss.
-                ascent_ce_batch_loss += get_local_tensor(ce_loss.detach())
-                del ce_loss
-                if z_batch_loss is not None:
-                    assert z_loss is not None
-                    z_batch_loss += get_local_tensor(z_loss.detach())
-                    del z_loss
+            # --- Save accumulated descent grads and zero for clean ascent ---
+            # On the first group saved_descent_grads is empty (p.grad is None).
+            # On subsequent groups it preserves the accumulated descent gradients
+            # so the ascent backward produces a clean, uncontaminated gradient.
+            saved_descent_grads: Dict[int, torch.Tensor] = {}
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    saved_descent_grads[id(p)] = p.grad
+                    p.grad = None
 
-                # Run backward pass.
-                loss.backward()
+            # --- Save RNG state for replay during descent ---
+            rng_state = get_rng_state()
 
-        # Restore parameters (remove perturbation).
-        if perturbations:
+            # --- ASCENT: accumulate gradients over this SAM group without DP sync ---
+            with self._sam_no_sync_context():
+                for mb_idx in range(group_start, group_end):
+                    input_ids, labels, model_kwargs = self._prepare_batch(
+                        micro_batches[mb_idx], keep_keys=True
+                    )
+                    _, loss, ce_loss, _ = self.model_forward(
+                        input_ids,
+                        labels=labels,
+                        ignore_index=self.label_ignore_index,
+                        loss_reduction="sum",
+                        z_loss_multiplier=self.z_loss_multiplier,
+                        loss_div_factor=batch_num_tokens_for_loss,
+                        return_logits=False,
+                        **model_kwargs,
+                    )
+                    ce_batch_loss += get_local_tensor(ce_loss.detach())
+                    del ce_loss
+                    loss.backward()
+
+            # --- Compute and apply perturbation from accumulated ascent gradient ---
+            scale_global: torch.Tensor = rho
+            if norm_mode == "global":
+                gnorm = self._grad_global_norm()
+                scale_global = (rho / (gnorm + self.sam_config.eps)).to(self.device)
+            perturbations: list[Tuple[nn.Parameter, torch.Tensor]] = []
+            for p in self.model.parameters():
+                if p.grad is None:
+                    continue
+                if self._sam_allowed_param_ids is not None and id(p) not in self._sam_allowed_param_ids:
+                    continue
+                if norm_mode == "none":
+                    scale_p = rho
+                elif norm_mode == "layer":
+                    p_norm = p.grad.detach().norm(2)
+                    scale_p = (rho / (p_norm + self.sam_config.eps)).to(self.device)
+                elif norm_mode == "global":
+                    scale_p = scale_global
+                else:
+                    raise OLMoConfigurationError(f"Invalid SAM normalization mode: {norm_mode}")
+                eps_w = p.grad.detach() * scale_p.to(dtype=p.dtype)
+                p.data.add_(eps_w)
+                perturbations.append((p, eps_w))
+
+            # --- Restore accumulated descent grads (discard ascent grads) ---
+            for p in self.model.parameters():
+                if id(p) in saved_descent_grads:
+                    p.grad = saved_descent_grads[id(p)]
+                else:
+                    p.grad = None
+            del saved_descent_grads
+
+            # --- Restore RNG state so descent sees identical dropout masks ---
+            set_rng_state(rng_state)
+            del rng_state
+
+            # --- DESCENT: forward+backward at perturbed weights ---
+            # DDP all-reduce fires only on the very last micro-batch of the entire
+            # device batch (descent_mb_counter == num_micro_batches - 1).
+            for mb_idx in range(group_start, group_end):
+                with self._train_microbatch_context(descent_mb_counter, num_micro_batches):
+                    input_ids, labels, model_kwargs = self._prepare_batch(micro_batches[mb_idx])
+
+                    _, loss, ce_loss, z_loss = self.model_forward(
+                        input_ids,
+                        labels=labels,
+                        ignore_index=self.label_ignore_index,
+                        loss_reduction="sum",
+                        z_loss_multiplier=self.z_loss_multiplier,
+                        loss_div_factor=batch_num_tokens_for_loss,
+                        return_logits=False,
+                        **model_kwargs,
+                    )
+
+                    perturbed_ce_batch_loss += get_local_tensor(ce_loss.detach())
+                    del ce_loss
+                    if z_batch_loss is not None:
+                        assert z_loss is not None
+                        z_batch_loss += get_local_tensor(z_loss.detach())
+                        del z_loss
+
+                    loss.backward()
+
+                descent_mb_counter += 1
+
+            # --- Restore original weights ---
             for p, eps_w in perturbations:
                 p.data.sub_(eps_w)
-            perturbations.clear()
+            del perturbations
 
         del batch  # In case this helps with memory utilization.
 
@@ -629,22 +791,21 @@ class TransformerSAMTrainModule(TrainModule):
         if isinstance(self.optim, SkipStepOptimizer):
             # Need to reduce the loss right away for the SkipStepOptimizer.
             if is_distributed():
-                initial_ce_batch_loss.div_(self._reduce_divide_factor)
-                dist.all_reduce(initial_ce_batch_loss)
-                initial_ce_batch_loss.div_(self.world_size)
-                initial_ce_batch_loss.mul_(self._reduce_divide_factor)
-            self.record_ce_loss(initial_ce_batch_loss)
-            # Reduce ascent CE loss the same way
+                ce_batch_loss.div_(self._reduce_divide_factor)
+                dist.all_reduce(ce_batch_loss)
+                ce_batch_loss.div_(self.world_size)
+                ce_batch_loss.mul_(self._reduce_divide_factor)
+            self.record_ce_loss(ce_batch_loss)
             if is_distributed():
-                ascent_ce_batch_loss.div_(self._reduce_divide_factor)
-                dist.all_reduce(ascent_ce_batch_loss)
-                ascent_ce_batch_loss.div_(self.world_size)
-                ascent_ce_batch_loss.mul_(self._reduce_divide_factor)
-            self.record_metric("Ascent CE Loss", ascent_ce_batch_loss, namespace="train")
-            self.optim.latest_loss = initial_ce_batch_loss
+                perturbed_ce_batch_loss.div_(self._reduce_divide_factor)
+                dist.all_reduce(perturbed_ce_batch_loss)
+                perturbed_ce_batch_loss.div_(self.world_size)
+                perturbed_ce_batch_loss.mul_(self._reduce_divide_factor)
+            self.record_metric("Perturbed CE Loss", perturbed_ce_batch_loss, namespace="train")
+            self.optim.latest_loss = ce_batch_loss
         else:
-            self.record_ce_loss(initial_ce_batch_loss, ReduceType.mean)
-            self.record_metric("Ascent CE Loss", ascent_ce_batch_loss, ReduceType.mean, namespace="train")
+            self.record_ce_loss(ce_batch_loss, ReduceType.mean)
+            self.record_metric("Perturbed CE Loss", perturbed_ce_batch_loss, ReduceType.mean, namespace="train")
         if z_batch_loss is not None:
             assert self.z_loss_multiplier is not None
             self.record_metric(
@@ -751,15 +912,7 @@ class TransformerSAMTrainModule(TrainModule):
     ) -> Generator[None, None, None]:
         is_last_mb = micro_batch_idx == num_micro_batches - 1
         with contextlib.ExitStack() as stack:
-            if isinstance(self.model, FSDPModule):
-                assert self.dp_config is not None
-                # On the last backward FSDP waits on pending gradient reduction and clears internal data
-                # data structures for backward prefetching.
-                self.model.set_is_last_backward(is_last_mb)
-                # For HSDP we can delay the gradients all-reduce until the final micro-batch.
-                if self.dp_config.name == DataParallelType.hsdp:
-                    self.model.set_requires_all_reduce(is_last_mb)
-            elif isinstance(self.model, DDP):
+            if isinstance(self.model, DDP):
                 # For DDP, only sync gradients on the final micro-batch.
                 if not is_last_mb:
                     stack.enter_context(self.model.no_sync())
@@ -781,28 +934,16 @@ class TransformerSAMTrainModule(TrainModule):
 
     @contextlib.contextmanager
     def _sam_no_sync_context(self) -> Generator[None, None, None]:
-        with contextlib.ExitStack() as stack:
-            if isinstance(self.model, DDP):
-                stack.enter_context(self.model.no_sync())
+        if isinstance(self.model, DDP):
+            with self.model.no_sync():
                 yield
-                return
-            if isinstance(self.model, FSDPModule) and hasattr(self.model, "set_requires_all_reduce"):
-                self.model.set_requires_all_reduce(False)
-                try:
-                    yield
-                finally:
-                    self.model.set_requires_all_reduce(True)
-                return
+        else:
             yield
 
     def _build_sam_allowed_param_ids(self) -> Optional[Set[int]]:
         types_str = (self.sam_config.sam_parameter_types or "").strip()
         if not types_str:
             return None
-        if isinstance(self.model, (FSDP, FSDPModule)):
-            raise OLMoConfigurationError(
-                "sam_parameter_types is not supported with FSDP-wrapped models due to parameter flattening"
-            )
         type_names = {t.strip().lower() for t in types_str.split(",") if t.strip()}
         allowed: Set[int] = set()
         for module in self.model.modules():
@@ -834,28 +975,12 @@ class TransformerSAMTrainModule(TrainModule):
     def _clip_grad_norm(
         self, max_grad_norm: float, norm_type: float = 2.0, foreach: Optional[bool] = None
     ) -> torch.Tensor:
-        if isinstance(self.model, FSDP):
-            return self.model.clip_grad_norm_(max_grad_norm)
-
-        # Adapted from https://github.com/pytorch/torchtitan/blob/2a4437014e66bcf88a3f0419b816266e6326d539/torchtitan/utils.py#L348
-
         parameters = [p for p in self.model.parameters()]
         grads = [p.grad for p in parameters if p.grad is not None]
 
         total_norm = nn.utils.get_total_norm(
             grads, norm_type=norm_type, error_if_nonfinite=False, foreach=foreach
         )
-
-        # If total_norm is a DTensor, the placements must be `torch.distributed._tensor.ops.math_ops._NormPartial`.
-        # We can simply reduce the DTensor to get the total norm in this tensor's process group
-        # and then convert it to a local tensor.
-        # NOTE: It has two purposes:
-        #       1. to make sure the total norm is computed correctly when PP is used (see below)
-        #       2. to return a reduced total_norm tensor whose .item() would return the correct value
-        if isinstance(total_norm, DTensor):
-            # Will reach here if any non-PP parallelism is used.
-            # If only using PP, total_norm will be a local tensor.
-            total_norm = total_norm.full_tensor()
 
         torch.nn.utils.clip_grads_with_norm_(parameters, max_grad_norm, total_norm, foreach=foreach)
         return total_norm
@@ -863,15 +988,19 @@ class TransformerSAMTrainModule(TrainModule):
     def _grad_global_norm(
         self, norm_type: float = 2.0, foreach: Optional[bool] = None
     ) -> torch.Tensor:
-        parameters = [p for p in self.model.parameters()]
-        grads = [p.grad for p in parameters if p.grad is not None]
+        # When sam_parameter_types restricts which parameters receive perturbations,
+        # compute the gradient norm only over those parameters so the perturbation
+        # magnitude is not diluted by gradients from non-perturbed parameters.
+        allowed = self._sam_allowed_param_ids
+        if allowed is not None:
+            grads = [p.grad for p in self.model.parameters() if p.grad is not None and id(p) in allowed]
+        else:
+            grads = [p.grad for p in self.model.parameters() if p.grad is not None]
         if not grads:
             return torch.tensor(0.0, device=self.device)
         total_norm = nn.utils.get_total_norm(
             grads, norm_type=norm_type, error_if_nonfinite=False, foreach=foreach
         )
-        if isinstance(total_norm, DTensor):
-            total_norm = total_norm.full_tensor()
         return total_norm
 
     def _prepare_batch(

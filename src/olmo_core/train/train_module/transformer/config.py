@@ -262,6 +262,55 @@ class TransformerActivationCheckpointingConfig(Config):
 
 
 @dataclass
+class TransformerEMAConfig(Config):
+    """
+    Configuration for tracking one or more exponential moving averages (EMAs) of the
+    model parameters during training.
+
+    Each EMA is stored as a per-parameter local-shard tensor (matching the FSDP/DTensor
+    sharding of the live model), so the total memory cost per rank is roughly
+    ``len(decays) * params_per_rank * dtype_size``. With ``offload_to_cpu=True`` the
+    shadows live in host memory, freeing GPU memory at the cost of host<->device copies
+    on every update.
+    """
+
+    decays: List[float]
+    """
+    The decay coefficients for the EMAs. One shadow is maintained per entry. Standard
+    values are in ``[0.99, 0.9999]``. The update rule is
+    ``shadow <- decay * shadow + (1 - decay) * param``.
+    """
+
+    offload_to_cpu: bool = False
+    """
+    If ``True``, store EMA shadow tensors on host (CPU) memory instead of the training
+    device. Reduces GPU memory pressure but adds a host<->device copy per update.
+    """
+
+    update_every_n_steps: int = 1
+    """
+    Update the EMAs every N optimizer steps. Defaults to every step.
+    """
+
+    init_from_model: bool = True
+    """
+    If ``True`` (the default), initialize each shadow from the current model parameters.
+    If ``False``, initialize them to zeros.
+    """
+
+    def __post_init__(self):
+        if not self.decays:
+            raise OLMoConfigurationError("'decays' must contain at least one value")
+        for d in self.decays:
+            if not (0.0 <= d < 1.0):
+                raise OLMoConfigurationError(
+                    f"EMA decay must be in [0, 1), got {d}"
+                )
+        if self.update_every_n_steps < 1:
+            raise OLMoConfigurationError("'update_every_n_steps' must be >= 1")
+
+
+@dataclass
 class TransformerTrainModuleConfig(Config):
     """
     A configuration class for building :class:`TransformerTrainModule` or
@@ -295,6 +344,14 @@ class TransformerTrainModuleConfig(Config):
     # Loss function settings.
 
     z_loss_multiplier: Optional[float] = None
+
+    # EMA settings.
+
+    ema: Optional[TransformerEMAConfig] = None
+    """
+    Optional config for tracking one or more EMAs of the model weights during training.
+    See :class:`TransformerEMAConfig`.
+    """
 
     # Checkpoint settings.
 
@@ -330,6 +387,11 @@ class TransformerTrainModuleConfig(Config):
             kwargs["state_dict_load_opts"] = dist_cp_sd.StateDictOptions(**state_dict_load_opts)
 
         if self.pp_config is not None:
+            if kwargs.pop("ema", None) is not None:
+                raise OLMoConfigurationError(
+                    "Weight EMA is not currently supported with pipeline parallelism "
+                    "(TransformerPipelineTrainModule)."
+                )
             return TransformerPipelineTrainModule(
                 model=model,
                 device=device,

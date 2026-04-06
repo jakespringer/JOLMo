@@ -96,7 +96,28 @@ class EvaluatorCallback(Callback):
 
         self._perform_eval()
 
+    def _record_metric(
+        self, full_name: str, value: torch.Tensor, *, variant_label: str
+    ) -> None:
+        """
+        Hook for subclasses to intercept metric recording. The base class simply
+        forwards to ``self.trainer.record_metric``.
+        """
+        del variant_label  # base class ignores
+        self.trainer.record_metric(full_name, value)
+
     def _perform_eval(self):
+        self._run_evaluators(metric_prefix="eval", variant_label="live")
+
+    def _run_evaluators(self, *, metric_prefix: str, variant_label: str):
+        """
+        Run all configured evaluators once and emit metrics under
+        ``f"{metric_prefix}/{evaluator.name}/{name}"``.
+
+        ``variant_label`` is an opaque tag passed to :meth:`_record_metric` so
+        subclasses can distinguish e.g. live vs. EMA evaluations. The base class
+        ignores it.
+        """
         # Put model in eval train mode.
         # TODO: make sure grads will be zeroed at this point
         #  self.trainer.optim.zero_grad(set_to_none=True)
@@ -108,7 +129,7 @@ class EvaluatorCallback(Callback):
         evaluator_bs = []
 
         for evaluator in self.evaluators:
-            log.info(f"Running {evaluator.name} evals...")
+            log.info(f"Running {evaluator.name} evals ({variant_label})...")
             start_time = time.monotonic()
             evaluator.reset_metrics()
             eval_step = 0
@@ -145,14 +166,16 @@ class EvaluatorCallback(Callback):
                 for name, value in metrics.items():
                     evaluation_names.append(name)
                     metrics_str.append(f"    {name}={format_float(value.item())}")
-                    self.trainer.record_metric(f"eval/{evaluator.name}/{name}", value)
+                    full_name = f"{metric_prefix}/{evaluator.name}/{name}"
+                    self._record_metric(full_name, value, variant_label=variant_label)
 
             evaluator_times.append(time.monotonic() - start_time)
             evaluator_names.append(evaluation_names)
             evaluator_bs.append(eval_step)
 
             log.info(
-                f"Finished {evaluator.name} evals in {time.monotonic() - start_time:.1f} seconds. Metrics:\n"
+                f"Finished {evaluator.name} evals ({variant_label}) in "
+                f"{time.monotonic() - start_time:.1f} seconds. Metrics:\n"
                 + "\n".join(metrics_str)
             )
 
@@ -193,6 +216,49 @@ class EvaluatorCallback(Callback):
             log.info(f"[eval={evaluator.name},step={eval_step}]")
 
 
+def _build_evaluator_callback(
+    trainer: "Trainer",
+    *,
+    evaluators: List[Evaluator],
+    eval_interval: int,
+    log_interval: int,
+    eval_on_startup: bool,
+    cancel_after_first_eval: bool,
+    eval_duration: Duration,
+    ema_track_metric: Optional[str] = None,
+    ema_track_metric_mode: str = "min",
+) -> Callback:
+    """
+    Build either an :class:`EvaluatorCallback` or its EMA-aware subclass, depending
+    on whether the attached train module has any EMA shadows configured.
+    """
+    tm = trainer.train_module
+    ema_config = getattr(tm, "ema_config", None)
+    if ema_config is not None:
+        # Local import to avoid a circular import (ema_evaluator_callback imports
+        # this module).
+        from .ema_evaluator_callback import EMAEvaluatorCallback
+
+        return EMAEvaluatorCallback(
+            evaluators=evaluators,
+            eval_interval=eval_interval,
+            log_interval=log_interval,
+            eval_on_startup=eval_on_startup,
+            cancel_after_first_eval=cancel_after_first_eval,
+            eval_duration=eval_duration,
+            track_metric=ema_track_metric,
+            track_metric_mode=ema_track_metric_mode,
+        )
+    return EvaluatorCallback(
+        evaluators=evaluators,
+        eval_interval=eval_interval,
+        log_interval=log_interval,
+        eval_on_startup=eval_on_startup,
+        cancel_after_first_eval=cancel_after_first_eval,
+        eval_duration=eval_duration,
+    )
+
+
 @dataclass
 class LMEvaluatorCallbackConfig(CallbackConfig):
     eval_dataset: NumpyDatasetConfig
@@ -202,6 +268,15 @@ class LMEvaluatorCallbackConfig(CallbackConfig):
     eval_duration: Duration = field(default_factory=lambda: Duration.epochs(1))
     log_interval: int = 5
     enabled: bool = True
+    ema_track_metric: Optional[str] = None
+    """
+    If the train module has weight EMAs configured, the resulting evaluator callback
+    is auto-promoted to :class:`~.ema_evaluator_callback.EMAEvaluatorCallback`. Set
+    this to a canonical metric name (e.g. ``"eval/lm/CrossEntropyLoss"``) to have it
+    cached per variant for use by :class:`~.ema_checkpointer.EMACheckpointerCallback`
+    in ``"best"`` save mode.
+    """
+    ema_track_metric_mode: str = "min"
 
     def build(self, trainer: "Trainer") -> Optional[Callback]:
         if not self.enabled:
@@ -256,13 +331,16 @@ class LMEvaluatorCallbackConfig(CallbackConfig):
             device=trainer.device,
             dp_process_group=trainer.dp_process_group,
         )
-        return EvaluatorCallback(
+        return _build_evaluator_callback(
+            trainer,
             evaluators=[evaluator],
             eval_interval=self.eval_interval,
             log_interval=self.log_interval,
             eval_on_startup=self.eval_on_startup,
             cancel_after_first_eval=self.cancel_after_first_eval,
             eval_duration=self.eval_duration,
+            ema_track_metric=self.ema_track_metric,
+            ema_track_metric_mode=self.ema_track_metric_mode,
         )
 
 
@@ -399,6 +477,9 @@ class DownstreamEvaluatorCallbackConfig(CallbackConfig):
     cancel_after_first_eval: bool = False
     log_interval: int = 5
     enabled: bool = True
+    ema_track_metric: Optional[str] = None
+    """See :data:`LMEvaluatorCallbackConfig.ema_track_metric`."""
+    ema_track_metric_mode: str = "min"
 
     def build(self, trainer: "Trainer") -> Optional[Callback]:
         if not self.enabled:
@@ -431,11 +512,14 @@ class DownstreamEvaluatorCallbackConfig(CallbackConfig):
                 )
             )
 
-        return EvaluatorCallback(
+        return _build_evaluator_callback(
+            trainer,
             evaluators=evaluators,
             eval_interval=self.eval_interval,
             eval_on_startup=self.eval_on_startup,
             cancel_after_first_eval=self.cancel_after_first_eval,
             log_interval=self.log_interval,
             eval_duration=self.eval_duration,
+            ema_track_metric=self.ema_track_metric,
+            ema_track_metric_mode=self.ema_track_metric_mode,
         )

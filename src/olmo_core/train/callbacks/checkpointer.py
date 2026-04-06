@@ -65,6 +65,13 @@ class CheckpointerCallback(Callback):
     The interval, in steps, with which to save permanent checkoints.
     """
 
+    save_steps: Optional[List[int]] = None
+    """
+    An explicit list of training steps at which to save permanent checkpoints,
+    in addition to the regular :data:`save_interval`. Useful for checkpointing at
+    custom irregular points (e.g. powers of 2).
+    """
+
     ephemeral_save_interval: Optional[int] = None
     """
     The interval, in steps, with which to save temporary checkpoints. These checkpoints are removed
@@ -252,7 +259,9 @@ class CheckpointerCallback(Callback):
         if not self.checkpoint_pending:
             self._remove_old_checkpoints()
 
-        if self.step % self.save_interval == 0:
+        if self.step % self.save_interval == 0 or (
+            self.save_steps is not None and self.step in self.save_steps
+        ):
             self._checkpoints.append(self._save_checkpoint())
         elif (
             self.ephemeral_save_interval is not None

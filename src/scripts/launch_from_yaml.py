@@ -67,6 +67,12 @@ class YamlExperimentConfig(Config):
     validation_datasets: Optional[Dict[str, List[str]]] = None
     # Optional eval interval for validation datasets. Defaults to 1000 if not set.
     validation_eval_interval: Optional[int] = None
+    # If the train module has weight EMAs configured, the auto-built LM evaluator is
+    # promoted to an EMAEvaluatorCallback. Set this to a canonical metric name
+    # (e.g. 'eval/lm/CrossEntropyLoss') so EMACheckpointerCallback in 'best' mode
+    # can pick the best variant.
+    validation_ema_track_metric: Optional[str] = None
+    validation_ema_track_metric_mode: Optional[str] = None
 
     init_seed: int = 12536
     load_path: Optional[str] = None
@@ -116,6 +122,13 @@ def _build_train_module_sam(
     if (state_dict_load_opts := kwargs.pop("state_dict_load_opts", None)) is not None:
         if dist_cp_sd is not None:
             kwargs["state_dict_load_opts"] = dist_cp_sd.StateDictOptions(**state_dict_load_opts)  # type: ignore
+
+    if kwargs.pop("ema", None) is not None:
+        raise ValueError(
+            "Weight EMA (`ema`) is not currently supported with the SAM train module. "
+            "TransformerSAMTrainModule does not inherit from TransformerTrainModule, so "
+            "the EMA hooks added there are not active. Add EMA support to SAM if needed."
+        )
 
     sam_cfg = cfg.sam
     return TransformerSAMTrainModule(model=model, sam_config=sam_cfg, sam_scheduler=cfg.sam_scheduler, **kwargs)
@@ -213,10 +226,15 @@ def _ensure_validation_callbacks(
     eval_dataset_cfg.paths = val_paths
     eval_dataset_cfg.metadata = metadata
 
-    eval_cb_cfg = LMEvaluatorCallbackConfig(
+    eval_cb_kwargs: Dict[str, Any] = dict(
         eval_dataset=eval_dataset_cfg,
         eval_interval=cfg.validation_eval_interval or 1000,
     )
+    if cfg.validation_ema_track_metric is not None:
+        eval_cb_kwargs["ema_track_metric"] = cfg.validation_ema_track_metric
+    if cfg.validation_ema_track_metric_mode is not None:
+        eval_cb_kwargs["ema_track_metric_mode"] = cfg.validation_ema_track_metric_mode
+    eval_cb_cfg = LMEvaluatorCallbackConfig(**eval_cb_kwargs)
     cb = eval_cb_cfg.build(trainer)
     if cb is not None:
         trainer.add_callback("lm_eval_validation", cb)

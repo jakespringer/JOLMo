@@ -49,6 +49,7 @@ from .config import (
     TransformerActivationCheckpointingConfig,
     TransformerContextParallelConfig,
     TransformerDataParallelConfig,
+    TransformerEMAConfig,
     TransformerExpertParallelConfig,
     TransformerTensorParallelConfig,
 )
@@ -115,6 +116,7 @@ class TransformerTrainModule(TrainModule):
         state_dict_load_opts: Optional[dist_cp_sd.StateDictOptions] = None,
         load_key_mapping: Optional[Dict[str, str]] = None,
         label_ignore_index: int = -100,
+        ema: Optional[TransformerEMAConfig] = None,
     ):
         super().__init__()
 
@@ -192,6 +194,26 @@ class TransformerTrainModule(TrainModule):
         log.info("Building optimizer...")
         self.optim: Optimizer = optim.build(self.model, strict=True)
 
+        # Weight EMA configuration. Shadow tensors are allocated *lazily* on first
+        # use, so that when training continues from a base model loaded after
+        # `__init__` (via `load_path`), the EMAs are seeded from the loaded base
+        # weights rather than the random-init weights present at `__init__` time.
+        # Lazy allocation also correctly handles checkpoint resume: a load that
+        # provides EMA state populates the shadows on first allocation, while a
+        # load that does not populate them lets training-time updates start from
+        # the just-loaded model state.
+        self.ema_config: Optional[TransformerEMAConfig] = ema
+        self._ema_shadows: List[Dict[str, torch.Tensor]] = []
+        self._ema_step_counter: int = 0
+        self._ema_loaded_from_checkpoint: bool = False
+        if self.ema_config is not None:
+            log.info(
+                f"Configured {len(self.ema_config.decays)} weight EMA shadow(s) "
+                f"with decays={list(self.ema_config.decays)}, "
+                f"offload_to_cpu={self.ema_config.offload_to_cpu}; "
+                "shadows will be allocated on first use."
+            )
+
     @property
     def dp_process_group(self) -> Optional[dist.ProcessGroup]:
         return None if self.world_mesh is None else get_dp_process_group(self.world_mesh)
@@ -238,6 +260,12 @@ class TransformerTrainModule(TrainModule):
                 f"global batch size ({self.trainer.global_batch_size:,d}) must be divisible by "
                 f"micro-batch size ({self.rank_microbatch_size:,d}) x DP world size ({dp_ws})"
             )
+
+        # Ensure EMA shadows are allocated before training starts. In the no-load
+        # path this is the first allocation; in the load path :meth:`load_state_dict`
+        # has already allocated and seeded them, so this is a no-op.
+        if self.ema_config is not None:
+            self._ensure_ema_shadows_allocated()
 
     def state_dict(self, *, optim: Optional[bool] = None) -> Dict[str, Any]:
         if optim is None:
@@ -287,6 +315,22 @@ class TransformerTrainModule(TrainModule):
                     load_opts = replace(load_opts, flatten_optimizer_state_dict=True)
 
         state_dict = self._get_state_dict(load_opts, optim=optim)
+
+        # Drop EMA template entries that aren't present in this checkpoint, so that
+        # resuming from a pre-EMA (or differently-configured-EMA) checkpoint succeeds
+        # under strict load mode. Missing shadows will retain their initial values.
+        if self.ema_config is not None:
+            checkpoint_keys = metadata.state_dict_metadata.keys()
+            for i in range(len(self.ema_config.decays)):
+                top_key = f"ema_{i}"
+                prefix = f"{top_key}."
+                if not any(k.startswith(prefix) for k in checkpoint_keys):
+                    state_dict.pop(top_key, None)
+                    log.warning(
+                        f"Checkpoint does not contain EMA shadow '{top_key}'; "
+                        "the live shadow will be left at its initial value."
+                    )
+
         if self.load_key_mapping is not None:
             swap_param_keys(state_dict, self.load_key_mapping, metadata=metadata)
 
@@ -305,6 +349,17 @@ class TransformerTrainModule(TrainModule):
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         load_optim = "optim" in state_dict
+
+        # Capture which EMA keys were present in the *input* state_dict — i.e., came
+        # from the actual checkpoint, not from a strict=False merge below. We will
+        # consume those entries after the model/optim load.
+        ema_input_keys: Dict[int, Dict[str, torch.Tensor]] = {}
+        if self.ema_config is not None:
+            for i in range(len(self.ema_config.decays)):
+                key = f"ema_{i}"
+                ema_sd = state_dict.get(key)
+                if ema_sd:
+                    ema_input_keys[i] = ema_sd
 
         if self.load_key_mapping is not None:
             swap_param_keys(state_dict, self.load_key_mapping, reverse=True, quiet=True)
@@ -335,6 +390,38 @@ class TransformerTrainModule(TrainModule):
                 options=self.state_dict_load_opts,
             )
             gc_cuda()
+
+        # Load EMA shadows if both the train module and the checkpoint have them.
+        # Use the keys captured *before* the strict=False merge above so that EMA
+        # template entries re-added by `merge_state_dicts` don't masquerade as real
+        # checkpoint data. For any EMA index *not* present in the checkpoint, re-seed
+        # the shadow from the live model — which has just been populated above by
+        # `set_model_state_dict`, so the new shadow will track the just-loaded
+        # weights. Doing this here (rather than in `pre_train`) ensures that any
+        # checkpoint write between this load and `train_module.pre_train` (e.g. an
+        # explicit step-0 pre-train save) sees consistent EMA state.
+        if self.ema_config is not None:
+            had_any = False
+            for i in range(len(self.ema_config.decays)):
+                if i in ema_input_keys:
+                    self._load_shadow_from_state(i, ema_input_keys[i])
+                    had_any = True
+                else:
+                    if self.ema_config.init_from_model and self._ema_shadows:
+                        log.warning(
+                            f"Checkpoint is missing EMA shadow 'ema_{i}'; "
+                            "re-seeding it from the just-loaded model parameters."
+                        )
+                        # Replace storage; this captures the post-load model state.
+                        self._ema_shadows[i] = self._init_ema_shadow()
+                    else:
+                        log.warning(
+                            f"Checkpoint is missing EMA shadow 'ema_{i}'; "
+                            "leaving its initial value unchanged "
+                            f"(init_from_model={self.ema_config.init_from_model})."
+                        )
+            if had_any:
+                self._ema_loaded_from_checkpoint = True
 
     def train_batch(self, batch: Dict[str, Any], dry_run: bool = False):
         # Set model to train mode if it isn't already.
@@ -502,6 +589,9 @@ class TransformerTrainModule(TrainModule):
         if isinstance(self.optim, SkipStepOptimizer):
             self.record_metric("step skipped", self.optim.step_skipped, namespace="optim")
 
+        # Update weight EMA shadows (no-op if no EMA configured).
+        self._ema_update()
+
         self.model.post_optim_step()
 
     def zero_grads(self):
@@ -563,7 +653,165 @@ class TransformerTrainModule(TrainModule):
             state_dict["optim"] = dist_cp_sd.get_optimizer_state_dict(
                 self.model, self.optim, options=sd_options
             )
+        if self.ema_config is not None:
+            self._ensure_ema_shadows_allocated()
+            for i in range(len(self.ema_config.decays)):
+                state_dict[f"ema_{i}"] = self._wrap_shadow_as_dtensor_state(i)
         return state_dict
+
+    # ------------------------------------------------------------------
+    # Weight EMA support.
+    # ------------------------------------------------------------------
+
+    def _ema_target_device(self) -> torch.device:
+        assert self.ema_config is not None
+        return torch.device("cpu") if self.ema_config.offload_to_cpu else self.device
+
+    def _init_ema_shadow(self) -> Dict[str, torch.Tensor]:
+        """Allocate one EMA shadow dict mapping parameter name -> local-shard tensor."""
+        assert self.ema_config is not None
+        target_device = self._ema_target_device()
+        shadow: Dict[str, torch.Tensor] = {}
+        for name, p in self.model.named_parameters():
+            local = get_local_tensor(p).detach()
+            if self.ema_config.init_from_model:
+                shadow[name] = local.to(device=target_device, copy=True)
+            else:
+                shadow[name] = torch.zeros_like(local, device=target_device)
+        return shadow
+
+    def _ensure_ema_shadows_allocated(self) -> None:
+        """
+        Lazily allocate EMA shadow tensors from the current model state. Called from
+        the first-use entry points: state-dict construction, EMA update, swap, and
+        :meth:`pre_train`. Subsequent calls are no-ops.
+        """
+        if self.ema_config is None or self._ema_shadows:
+            return
+        self._ema_shadows = [self._init_ema_shadow() for _ in self.ema_config.decays]
+        shadow_bytes = sum(
+            t.numel() * t.element_size() for t in self._ema_shadows[0].values()
+        )
+        log.info(
+            f"Allocated {len(self._ema_shadows)} weight EMA shadow(s) "
+            f"(per-shadow local size = {shadow_bytes / (1024 ** 2):.1f} MiB)"
+        )
+
+    @torch.no_grad()
+    def _ema_update(self) -> None:
+        """Apply ``shadow <- decay * shadow + (1 - decay) * param`` to all EMA shadows."""
+        if self.ema_config is None:
+            return
+        self._ensure_ema_shadows_allocated()
+        self._ema_step_counter += 1
+        if self._ema_step_counter % self.ema_config.update_every_n_steps != 0:
+            return
+        for decay, shadow in zip(self.ema_config.decays, self._ema_shadows):
+            weight = 1.0 - decay
+            for name, p in self.model.named_parameters():
+                live_local = get_local_tensor(p).detach()
+                tgt = shadow[name]
+                if tgt.device != live_local.device:
+                    # Cross-device path (typically GPU -> CPU offload). Use a
+                    # synchronous copy to avoid races with the subsequent host-side
+                    # lerp_. The CPU-offload path is already bandwidth-bound, so the
+                    # extra sync is negligible.
+                    live_local = live_local.to(tgt.device)
+                if tgt.dtype != live_local.dtype:
+                    live_local = live_local.to(dtype=tgt.dtype)
+                tgt.lerp_(live_local, weight)
+
+    @contextlib.contextmanager
+    def use_ema_params(self, ema_idx: int) -> Generator[None, None, None]:
+        """
+        Temporarily swap the live model's parameter shards with EMA shadow ``ema_idx``.
+        The original parameters are restored when the context manager exits, even on
+        exceptions. Memory cost while the block is active is one extra copy of the
+        local parameter shards on the live device.
+        """
+        if self.ema_config is None:
+            raise RuntimeError("No EMA shadows are configured on this train module")
+        self._ensure_ema_shadows_allocated()
+        if not (0 <= ema_idx < len(self._ema_shadows)):
+            raise IndexError(
+                f"EMA index {ema_idx} out of range (have {len(self._ema_shadows)} shadows)"
+            )
+        shadow = self._ema_shadows[ema_idx]
+        saved: Dict[str, torch.Tensor] = {}
+        try:
+            for name, p in self.model.named_parameters():
+                live_local = get_local_tensor(p)
+                saved[name] = live_local.detach().clone()
+                src = shadow[name]
+                # CPU -> GPU path for offloaded shadows; safe to be non-blocking
+                # because the subsequent .copy_ runs on the same CUDA stream.
+                if src.device != live_local.device:
+                    src = src.to(live_local.device, non_blocking=True)
+                if src.dtype != live_local.dtype:
+                    src = src.to(dtype=live_local.dtype)
+                live_local.copy_(src)
+            yield
+        finally:
+            for name, p in self.model.named_parameters():
+                if name in saved:
+                    get_local_tensor(p).copy_(saved[name])
+
+    def _wrap_shadow_as_dtensor_state(self, ema_idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Build a ``{param_name: tensor}`` state dict matching the live model's structure,
+        wrapping each shadow shard so it shares mesh/placement with the corresponding
+        live parameter. Used at save time so distributed checkpointing handles EMA
+        sharding via the same path as the model state.
+
+        Each entry is a *clone* of the live shadow storage (never an alias). This
+        matters for async checkpoint saves: they may continue reading from the
+        returned tensors after this method returns, while training continues to
+        update the live shadows in :meth:`_ema_update`. Aliasing would race.
+        """
+        assert self.ema_config is not None
+        shadow = self._ema_shadows[ema_idx]
+        out: Dict[str, torch.Tensor] = {}
+        for name, p in self.model.named_parameters():
+            local = shadow[name]
+            # Always clone to break aliasing with live storage. For an on-GPU shadow
+            # this is a same-device clone; for a CPU-offloaded shadow it's a
+            # CPU->GPU copy needed to match the live param's device mesh.
+            staged = local.detach().to(p.device, copy=True)
+            if isinstance(p, DTensor):
+                out[name] = DTensor.from_local(
+                    staged,
+                    device_mesh=p.device_mesh,
+                    placements=p.placements,
+                )
+            else:
+                out[name] = staged
+        return out
+
+    def _load_shadow_from_state(
+        self, ema_idx: int, sd: Dict[str, torch.Tensor]
+    ) -> None:
+        """
+        Inverse of :meth:`_wrap_shadow_as_dtensor_state`. Copies the loaded
+        per-parameter tensors back into the EMA shadow storage, honoring the
+        configured device placement.
+        """
+        assert self.ema_config is not None
+        target_device = self._ema_target_device()
+        shadow = self._ema_shadows[ema_idx]
+        missing: List[str] = []
+        for name, _ in self.model.named_parameters():
+            if name not in sd:
+                missing.append(name)
+                continue
+            loaded = sd[name]
+            local = get_local_tensor(loaded).detach().to(target_device)
+            shadow[name] = local
+        if missing:
+            log.warning(
+                f"EMA shadow {ema_idx} missing {len(missing)} parameter(s) at load "
+                f"(first few: {missing[:3]}); those entries are unchanged."
+            )
+        self._ema_loaded_from_checkpoint = True
 
     def _clip_grad_norm(
         self, max_grad_norm: float, norm_type: float = 2.0, foreach: Optional[bool] = None

@@ -184,9 +184,14 @@ class WSD(Scheduler):
                 DeprecationWarning,
             )
 
+        if self.decay is not None and self.decay_fraction is not None:
+            # Both set: an absolute ``decay`` length takes precedence over the
+            # default fractional value, so callers can override the dataclass
+            # default by passing only ``decay``.
+            self.decay_fraction = None
         if (self.decay_fraction is None) == (self.decay is None):
             raise OLMoConfigurationError(
-                "Either 'decay_fraction' or 'decay' must be specified. Never both."
+                "Either 'decay_fraction' or 'decay' must be specified."
             )
 
         if self.decay_fraction is not None and (self.decay_fraction < 0 or self.decay_fraction > 1):
@@ -470,6 +475,9 @@ def _linear_warmup(
 ) -> Union[float, torch.Tensor]:
     if isinstance(initial_lr, float):  # not worth the potential host-device sync if it's a tensor
         assert 0 <= warmup_min_lr < initial_lr
+    if warmup <= 0:
+        # No warmup configured: jump straight to the initial LR.
+        return initial_lr
     return warmup_min_lr + (initial_lr - warmup_min_lr) * min(current, warmup) / warmup
 
 

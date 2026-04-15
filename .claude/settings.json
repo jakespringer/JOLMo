@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh search:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(find /usr0/home/jspringe/projects/diversity-transfer -name .project* -o -name project*)",
+      "Read(//usr0/home/jspringe/**)",
+      "Read(//media/disk1/projects/diversity.pretraining.v2/PassAtKEvaluation/pass-at-k/JOLMo-0.6B-Vanilla-v2-tulu-vanilla-sft-lr4e-4-wd0e+00-bs512-accf/**)",
+      "Read(//media/disk1/projects/diversity.pretraining.v2/**)",
+      "Read(//home/jspringe/**)"
+    ]
+  }
+}

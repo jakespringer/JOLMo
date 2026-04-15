@@ -67,6 +67,9 @@ class YamlExperimentConfig(Config):
     validation_datasets: Optional[Dict[str, List[str]]] = None
     # Optional eval interval for validation datasets. Defaults to 1000 if not set.
     validation_eval_interval: Optional[int] = None
+    # Optional explicit list of training steps at which to run validation evals,
+    # in addition to ``validation_eval_interval``.
+    validation_eval_steps: Optional[List[int]] = None
     # If the train module has weight EMAs configured, the auto-built LM evaluator is
     # promoted to an EMAEvaluatorCallback. Set this to a canonical metric name
     # (e.g. 'eval/lm/CrossEntropyLoss') so EMACheckpointerCallback in 'best' mode
@@ -230,6 +233,8 @@ def _ensure_validation_callbacks(
         eval_dataset=eval_dataset_cfg,
         eval_interval=cfg.validation_eval_interval or 1000,
     )
+    if cfg.validation_eval_steps is not None:
+        eval_cb_kwargs["eval_steps"] = list(cfg.validation_eval_steps)
     if cfg.validation_ema_track_metric is not None:
         eval_cb_kwargs["ema_track_metric"] = cfg.validation_ema_track_metric
     if cfg.validation_ema_track_metric_mode is not None:

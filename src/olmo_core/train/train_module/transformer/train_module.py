@@ -738,23 +738,30 @@ class TransformerTrainModule(TrainModule):
             )
         shadow = self._ema_shadows[ema_idx]
         saved: Dict[str, torch.Tensor] = {}
+        # NOTE: model parameters typically have ``requires_grad=True``, so their
+        # ``_local_tensor`` is a leaf variable that autograd refuses to mutate via
+        # ``.copy_()``. We bypass this by writing to ``.data`` (the standard PyTorch
+        # idiom for in-place parameter mutation outside of autograd) and also wrap
+        # the whole swap in ``torch.no_grad()`` for good measure.
         try:
-            for name, p in self.model.named_parameters():
-                live_local = get_local_tensor(p)
-                saved[name] = live_local.detach().clone()
-                src = shadow[name]
-                # CPU -> GPU path for offloaded shadows; safe to be non-blocking
-                # because the subsequent .copy_ runs on the same CUDA stream.
-                if src.device != live_local.device:
-                    src = src.to(live_local.device, non_blocking=True)
-                if src.dtype != live_local.dtype:
-                    src = src.to(dtype=live_local.dtype)
-                live_local.copy_(src)
+            with torch.no_grad():
+                for name, p in self.model.named_parameters():
+                    live_local = get_local_tensor(p)
+                    saved[name] = live_local.detach().clone()
+                    src = shadow[name]
+                    # CPU -> GPU path for offloaded shadows; safe to be non-blocking
+                    # because the subsequent copy runs on the same CUDA stream.
+                    if src.device != live_local.device:
+                        src = src.to(live_local.device, non_blocking=True)
+                    if src.dtype != live_local.dtype:
+                        src = src.to(dtype=live_local.dtype)
+                    live_local.data.copy_(src)
             yield
         finally:
-            for name, p in self.model.named_parameters():
-                if name in saved:
-                    get_local_tensor(p).copy_(saved[name])
+            with torch.no_grad():
+                for name, p in self.model.named_parameters():
+                    if name in saved:
+                        get_local_tensor(p).data.copy_(saved[name])
 
     def _wrap_shadow_as_dtensor_state(self, ema_idx: int) -> Dict[str, torch.Tensor]:
         """

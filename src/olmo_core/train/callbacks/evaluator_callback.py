@@ -58,6 +58,12 @@ class EvaluatorCallback(Callback):
     The interval (in steps) with which to run the evaluators.
     """
 
+    eval_steps: Optional[List[int]] = None
+    """
+    An explicit list of training steps at which to run the evaluators, in addition
+    to the regular ``eval_interval``. Mirrors :attr:`CheckpointerCallback.save_steps`.
+    """
+
     eval_on_startup: bool = False
     """
     Whether to run an evaluation when the trainer starts up.
@@ -91,7 +97,11 @@ class EvaluatorCallback(Callback):
             self._perform_eval()
 
     def post_step(self):
-        if self.step <= 1 or self.step % self.eval_interval != 0:
+        if self.step <= 1:
+            return
+        periodic = self.eval_interval > 0 and self.step % self.eval_interval == 0
+        explicit = self.eval_steps is not None and self.step in self.eval_steps
+        if not (periodic or explicit):
             return
 
         self._perform_eval()
@@ -225,6 +235,7 @@ def _build_evaluator_callback(
     eval_on_startup: bool,
     cancel_after_first_eval: bool,
     eval_duration: Duration,
+    eval_steps: Optional[List[int]] = None,
     ema_track_metric: Optional[str] = None,
     ema_track_metric_mode: str = "min",
 ) -> Callback:
@@ -242,6 +253,7 @@ def _build_evaluator_callback(
         return EMAEvaluatorCallback(
             evaluators=evaluators,
             eval_interval=eval_interval,
+            eval_steps=eval_steps,
             log_interval=log_interval,
             eval_on_startup=eval_on_startup,
             cancel_after_first_eval=cancel_after_first_eval,
@@ -252,6 +264,7 @@ def _build_evaluator_callback(
     return EvaluatorCallback(
         evaluators=evaluators,
         eval_interval=eval_interval,
+        eval_steps=eval_steps,
         log_interval=log_interval,
         eval_on_startup=eval_on_startup,
         cancel_after_first_eval=cancel_after_first_eval,
@@ -263,6 +276,7 @@ def _build_evaluator_callback(
 class LMEvaluatorCallbackConfig(CallbackConfig):
     eval_dataset: NumpyDatasetConfig
     eval_interval: int = 1000
+    eval_steps: Optional[List[int]] = None
     eval_on_startup: bool = False
     cancel_after_first_eval: bool = False
     eval_duration: Duration = field(default_factory=lambda: Duration.epochs(1))
@@ -335,6 +349,7 @@ class LMEvaluatorCallbackConfig(CallbackConfig):
             trainer,
             evaluators=[evaluator],
             eval_interval=self.eval_interval,
+            eval_steps=self.eval_steps,
             log_interval=self.log_interval,
             eval_on_startup=self.eval_on_startup,
             cancel_after_first_eval=self.cancel_after_first_eval,

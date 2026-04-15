@@ -24,6 +24,7 @@ from .profiler import ProfilerCallback
 from .sequence_length_scheduler import SequenceLengthSchedulerCallback
 from .slack_notifier import SlackNotificationSetting, SlackNotifierCallback
 from .speed_monitor import SpeedMonitorCallback
+from .stop_at_step import StopAtStepCallback
 from .wandb import WandBCallback
 
 __all__ = [

@@ -9,6 +9,7 @@ import torch
 from olmo_core.config import Config
 from olmo_core.data import NumpyDataLoaderConfig, NumpyDatasetConfig, NumpyPaddedFSLDatasetConfig
 from olmo_core.distributed.utils import get_rank
+from olmo_core.exceptions import OLMoConfigurationError
 from olmo_core.io import is_url
 from olmo_core.nn.transformer import TransformerConfig, Transformer
 from olmo_core.train import (
@@ -19,10 +20,19 @@ from olmo_core.train import (
 from olmo_core.train.callbacks import ConfigSaverCallback, WandBCallback, LMEvaluatorCallbackConfig
 from olmo_core.train.train_module import TrainModule, TransformerTrainModuleConfig
 from olmo_core.train.train_module.transformer.config import TransformerSAMConfig
+from olmo_core.train.train_module.transformer.distill_train_module import (
+    DistillConfig,
+    TransformerDistillTrainModule,
+)
+from olmo_core.train.train_module.transformer.rep_loss_train_module import (
+    RepLossConfig,
+    TransformerRepLossTrainModule,
+)
 from olmo_core.train.train_module.transformer.sam_train_module import (
     SAMScheduler,
     TransformerSAMTrainModule,
 )
+from olmo_core.train.train_module.transformer.teacher import TeacherModelConfig
 from olmo_core.train.trainer import Trainer
 from olmo_core.train.common import Duration
 from olmo_core.utils import seed_all
@@ -53,12 +63,16 @@ class YamlExperimentConfig(Config):
     dataset: Optional[NumpyDatasetConfig] = None
     data_loader: Optional[NumpyDataLoaderConfig] = None
 
-    # "normal" or "sam"
+    # "normal", "sam", "distill", or "rep_loss"
     train_module_type: str = "normal"
     train_module: Optional[TransformerTrainModuleConfig] = None
     # SAM-only config (optional)
     sam: Optional[TransformerSAMConfig] = None  # populated dynamically if available
     sam_scheduler: Optional[SAMScheduler] = None  # schedule for sam rho, if provided
+    # Teacher-based training (distill / rep_loss only).
+    teacher: Optional[TeacherModelConfig] = None
+    distill: Optional[DistillConfig] = None
+    rep_loss: Optional[RepLossConfig] = None
 
     trainer: Optional[TrainerConfig] = None
     wandb: Optional[WandBSettings] = None
@@ -105,36 +119,62 @@ def _build_train_module_normal(
     return cfg.train_module.build(model)
 
 
-def _build_train_module_sam(
-    cfg: YamlExperimentConfig, model: Transformer
-) -> TrainModule:
-    assert cfg.train_module is not None
-    try:
-        import torch.distributed.checkpoint.state_dict as dist_cp_sd  # type: ignore
-    except Exception:  # pragma: no cover
-        dist_cp_sd = None  # type: ignore
+def _common_train_module_kwargs(cfg: YamlExperimentConfig) -> Dict[str, Any]:
+    """Shared autocast / state-dict-opts conversion. Used by the SAM,
+    distill, and rep_loss train-module builders."""
+    import torch.distributed.checkpoint.state_dict as dist_cp_sd
     from olmo_core.config import DType
 
-    # Mirror TransformerTrainModuleConfig.build(...) behavior while routing to SAM module.
+    assert cfg.train_module is not None
     kwargs = cfg.train_module.as_dict(exclude_none=True, recurse=False)
     if (autocast_precision := kwargs.pop("autocast_precision", None)) is not None:
         kwargs["autocast_precision"] = cast(DType, autocast_precision).as_pt()
     if (state_dict_save_opts := kwargs.pop("state_dict_save_opts", None)) is not None:
-        if dist_cp_sd is not None:
-            kwargs["state_dict_save_opts"] = dist_cp_sd.StateDictOptions(**state_dict_save_opts)  # type: ignore
+        kwargs["state_dict_save_opts"] = dist_cp_sd.StateDictOptions(**state_dict_save_opts)
     if (state_dict_load_opts := kwargs.pop("state_dict_load_opts", None)) is not None:
-        if dist_cp_sd is not None:
-            kwargs["state_dict_load_opts"] = dist_cp_sd.StateDictOptions(**state_dict_load_opts)  # type: ignore
+        kwargs["state_dict_load_opts"] = dist_cp_sd.StateDictOptions(**state_dict_load_opts)
+    return kwargs
 
+
+def _build_train_module_sam(
+    cfg: YamlExperimentConfig, model: Transformer
+) -> TrainModule:
+    kwargs = _common_train_module_kwargs(cfg)
     if kwargs.pop("ema", None) is not None:
         raise ValueError(
             "Weight EMA (`ema`) is not currently supported with the SAM train module. "
             "TransformerSAMTrainModule does not inherit from TransformerTrainModule, so "
             "the EMA hooks added there are not active. Add EMA support to SAM if needed."
         )
+    return TransformerSAMTrainModule(
+        model=model, sam_config=cfg.sam, sam_scheduler=cfg.sam_scheduler, **kwargs
+    )
 
-    sam_cfg = cfg.sam
-    return TransformerSAMTrainModule(model=model, sam_config=sam_cfg, sam_scheduler=cfg.sam_scheduler, **kwargs)
+
+def _build_train_module_distill(
+    cfg: YamlExperimentConfig, model: Transformer
+) -> TrainModule:
+    if cfg.teacher is None or cfg.distill is None:
+        raise OLMoConfigurationError(
+            "train_module_type='distill' requires 'teacher' and 'distill' sections"
+        )
+    kwargs = _common_train_module_kwargs(cfg)
+    return TransformerDistillTrainModule(
+        model=model, teacher=cfg.teacher, distill=cfg.distill, **kwargs
+    )
+
+
+def _build_train_module_rep_loss(
+    cfg: YamlExperimentConfig, model: Transformer
+) -> TrainModule:
+    if cfg.teacher is None or cfg.rep_loss is None:
+        raise OLMoConfigurationError(
+            "train_module_type='rep_loss' requires 'teacher' and 'rep_loss' sections"
+        )
+    kwargs = _common_train_module_kwargs(cfg)
+    return TransformerRepLossTrainModule(
+        model=model, teacher=cfg.teacher, rep_loss=cfg.rep_loss, **kwargs
+    )
 
 
 def _ensure_wandb_callback(
@@ -292,8 +332,13 @@ def main():
     seed_all(cfg.init_seed)
 
     model = _build_model(cfg)
-    if cfg.train_module_type.lower() == "sam":
+    tmt = cfg.train_module_type.lower()
+    if tmt == "sam":
         train_module = _build_train_module_sam(cfg, model)
+    elif tmt == "distill":
+        train_module = _build_train_module_distill(cfg, model)
+    elif tmt == "rep_loss":
+        train_module = _build_train_module_rep_loss(cfg, model)
     else:
         train_module = _build_train_module_normal(cfg, model)
 

@@ -36,6 +36,7 @@ from olmo_core.distributed.utils import (
 from olmo_core.exceptions import OLMoConfigurationError
 from olmo_core.float8 import Float8Config
 from olmo_core.nn.lm_head import LMOutputWithLoss
+from olmo_core.nn.peft import PEFTConfig
 from olmo_core.nn.transformer import Transformer
 from olmo_core.nn.transformer.config import TransformerActivationCheckpointingMode
 from olmo_core.optim import OptimConfig, SkipStepOptimizer
@@ -117,6 +118,7 @@ class TransformerTrainModule(TrainModule):
         load_key_mapping: Optional[Dict[str, str]] = None,
         label_ignore_index: int = -100,
         ema: Optional[TransformerEMAConfig] = None,
+        peft: Optional[PEFTConfig] = None,
     ):
         super().__init__()
 
@@ -126,6 +128,25 @@ class TransformerTrainModule(TrainModule):
                 f"'rank_microbatch_size' ({rank_microbatch_size:,d} tokens) must be divisible by "
                 f"'max_sequence_length' ({max_sequence_length:,d} tokens)"
             )
+
+        # Apply PEFT model transforms BEFORE parallelization. This lets
+        # FSDP/TP/AC/compile see the post-LoRA module graph and shard or
+        # parallelize the added adapter modules just like the original
+        # weights. Frozen base parameters are picked up by
+        # OptimConfig.build_groups (it skips requires_grad=False) when
+        # the optimizer is built below.
+        #
+        # LoRA's design uses property delegation on ``LoRALinear.weight``
+        # and a no-op ``reset_parameters`` on its ``A``/``B`` branches so
+        # the model's standard init pass leaves adapter values intact.
+        # If a future PEFT method needs a more aggressive skip (e.g.,
+        # leaving entire components uninitialized), wire a predicate
+        # through ``Transformer.init_weights`` at that time.
+        self.peft = peft
+        peft_key_mapping: Optional[Dict[str, str]] = None
+        if self.peft is not None:
+            self.peft.apply_model_transforms(model)
+            peft_key_mapping = self.peft.checkpoint_key_mapping(model)
 
         # Build world mesh.
         self.device = device or get_default_device()
@@ -188,7 +209,18 @@ class TransformerTrainModule(TrainModule):
         self.state_dict_load_opts = state_dict_load_opts or dist_cp_sd.StateDictOptions(
             flatten_optimizer_state_dict=True, strict=True
         )
-        self.load_key_mapping = load_key_mapping
+        # Merge any user-provided load_key_mapping with the mapping
+        # contributed by PEFT model transforms (e.g. LoRA renames
+        # ``*.w_q.weight`` → ``*.w_q.base.weight``). Conflicts here
+        # already raised inside ``PEFTConfig.checkpoint_key_mapping``.
+        if peft_key_mapping:
+            merged_mapping: Dict[str, str] = dict(peft_key_mapping)
+            if load_key_mapping:
+                # User-provided overrides PEFT defaults.
+                merged_mapping.update(load_key_mapping)
+            self.load_key_mapping = merged_mapping
+        else:
+            self.load_key_mapping = load_key_mapping
 
         # Build optimizer(s).
         log.info("Building optimizer...")
@@ -249,6 +281,15 @@ class TransformerTrainModule(TrainModule):
     @cached_property
     def _reduce_divide_factor(self) -> float:
         return get_reduce_divide_factor(self.world_size)
+
+    def on_attach(self):
+        # Auto-install the PEFT gradient callback when any gradient
+        # transforms are configured. The callback runs every transform
+        # at ``pre_optim_step`` (before grad clipping inside
+        # ``optim_step``). This is a no-op when ``peft`` is None or has
+        # no gradient transforms.
+        if self.peft is not None:
+            self.peft.install_gradient_callback(self.trainer)
 
     def pre_train(self):
         # Validate batch size.
@@ -537,7 +578,10 @@ class TransformerTrainModule(TrainModule):
             )
 
     def eval_batch(
-        self, batch: Dict[str, Any], labels: Optional[torch.Tensor] = None
+        self,
+        batch: Dict[str, Any],
+        labels: Optional[torch.Tensor] = None,
+        return_logits: bool = True,
     ) -> Union[torch.Tensor, LMOutputWithLoss]:
         # TODO: (epwalsh) Currently all of our evaluators require the full logits locally,
         # but when we're using CP/TP we usually can't materialize the full logits locally (due to OOMs).
@@ -564,6 +608,7 @@ class TransformerTrainModule(TrainModule):
                 labels=labels,
                 ignore_index=self.label_ignore_index,
                 loss_reduction="none",
+                return_logits=return_logits,
                 **model_kwargs,
             )
 

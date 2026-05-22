@@ -23,6 +23,7 @@ from olmo_core.nn.lm_head import LMOutputWithLoss
 from olmo_core.utils import (
     cuda_sync_debug_mode,
     format_float,
+    gc_cuda,
     get_default_device,
     move_to_device,
 )
@@ -97,6 +98,12 @@ class EvaluatorCallback(Callback):
             self._perform_eval()
 
     def post_step(self):
+        if self.step == 1 and self._has_future_evals():
+            # Run a baseline eval after a single training step so the run surfaces
+            # any eval-path issues (e.g. OOM) immediately rather than waiting for
+            # the first periodic eval.
+            self._perform_eval()
+            return
         if self.step <= 1:
             return
         periodic = self.eval_interval > 0 and self.step % self.eval_interval == 0
@@ -105,6 +112,26 @@ class EvaluatorCallback(Callback):
             return
 
         self._perform_eval()
+
+    def _has_future_evals(self) -> bool:
+        """True iff at least one eval would fire at some step in ``(1, max_steps]``.
+
+        The step-1 eval is only worth running if some later eval is also going to
+        run during training — otherwise we'd be doing an eval that the user
+        never asked for.
+        """
+        try:
+            max_steps = self.trainer.max_steps
+        except Exception:
+            # If max_steps can't be determined yet, assume future evals may run.
+            return True
+        if self.eval_interval > 0 and self.eval_interval <= max_steps:
+            return True
+        if self.eval_steps:
+            for s in self.eval_steps:
+                if 1 < s <= max_steps:
+                    return True
+        return False
 
     def _record_metric(
         self, full_name: str, value: torch.Tensor, *, variant_label: str
@@ -134,6 +161,12 @@ class EvaluatorCallback(Callback):
         #  self.trainer.model.eval()
         dp_world_size = get_world_size(self.trainer.dp_process_group)
 
+        # Release the training forward/backward's fragmented CUDA reservations back
+        # to the allocator pool before allocating eval-time forward activations
+        # (esp. the full (B, T, V) logits tensor). Without this, the allocator can
+        # OOM even when enough memory is theoretically free but fragmented.
+        gc_cuda()
+
         evaluator_times = []
         evaluator_names = []
         evaluator_bs = []
@@ -144,6 +177,10 @@ class EvaluatorCallback(Callback):
             evaluator.reset_metrics()
             eval_step = 0
             eval_tokens = 0
+            # If the evaluator only needs per-token CE loss, skip returning the
+            # full logits tensor — eliminates one B*T*V allocation per iteration
+            # (e.g. 16 GiB for 32K tokens × 128K vocab in fp32).
+            return_logits = getattr(evaluator, "needs_logits", True)
             for batch in evaluator:
                 eval_step += 1
                 eval_tokens += batch["input_ids"].numel() * dp_world_size
@@ -152,13 +189,21 @@ class EvaluatorCallback(Callback):
                 with torch.no_grad():
                     # Run forward pass, get logits and un-reduced CE loss.
                     labels = get_labels(batch)
-                    output = self.trainer.train_module.eval_batch(batch, labels=labels)
+                    output = self.trainer.train_module.eval_batch(
+                        batch, labels=labels, return_logits=return_logits
+                    )
                     assert isinstance(output, LMOutputWithLoss)
                     logits, _, ce_loss, _ = output
 
                     # NOTE: might have host-device syncs here but that's okay.
                     with cuda_sync_debug_mode(0):
                         evaluator.update_metrics(batch, ce_loss, logits)
+
+                # Drop references so the previous iteration's logits / ce_loss /
+                # LMOutputWithLoss don't live into the *next* forward pass. Without
+                # this, peak memory briefly doubles when the next eval_batch call
+                # allocates a new logits tensor while the old one is still bound.
+                del output, logits, ce_loss, batch, labels
 
                 if self.eval_duration.due(step=eval_step, tokens=eval_tokens, epoch=1):
                     self._log_progress(evaluator, eval_step)

@@ -75,6 +75,14 @@ class Float8Config(Config):
                 ignored_modules_found.add(fqn)
                 return False
 
+            # Protocol-based opt-out: modules carrying a truthy
+            # ``_peft_no_fp8`` attribute (e.g., the LoRA ``A``/``B``
+            # branches via :class:`~olmo_core.nn.peft.lora._LoRABranchLinear`)
+            # are skipped. Avoids a hard dependency on the peft package
+            # from this module.
+            if getattr(m, "_peft_no_fp8", False):
+                return False
+
             # Linear layers must have all dimensions divisible by 16.
             if isinstance(m, nn.Linear):
                 for d in m.weight.shape:

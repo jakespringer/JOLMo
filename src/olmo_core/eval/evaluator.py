@@ -20,6 +20,13 @@ class Evaluator(metaclass=ABCMeta):
     :param device: The device to compute/reduce metrics on.
     """
 
+    needs_logits: bool = True
+    """
+    Whether :meth:`update_metrics` needs the full ``(B, T, V)`` logits tensor.
+    Subclasses that only consume the per-token CE loss should set this to
+    ``False`` so the eval loop can avoid materializing / holding logits.
+    """
+
     def __init__(
         self,
         *,

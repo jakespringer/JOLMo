@@ -20,6 +20,7 @@ from .garbage_collector import GarbageCollectorCallback
 from .gpu_memory_monitor import GPUMemoryMonitorCallback
 from .list_checkpointer import ListCheckpointerCallback
 from .monkey_patcher import MonkeyPatcherCallback
+from .peft_gradient import PEFTGradientCallback
 from .profiler import ProfilerCallback
 from .sequence_length_scheduler import SequenceLengthSchedulerCallback
 from .slack_notifier import SlackNotificationSetting, SlackNotifierCallback
@@ -54,6 +55,7 @@ __all__ = [
     "BatchSizeSchedulerCallback",
     "MonkeyPatcherCallback",
     "ListCheckpointerCallback",
+    "PEFTGradientCallback",
 ]
 
 __doc__ += "\n"

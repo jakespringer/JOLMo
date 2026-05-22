@@ -59,6 +59,19 @@ class SpeedMonitorCallback(Callback):
         else:
             return None
 
+    def _get_num_flops_per_token_parts(self, seq_len: int) -> Optional[Dict[str, int]]:
+        """Return a per-model FLOPs/token breakdown if the train module
+        provides one, else ``None``. Used to log a separate MFU metric
+        per model (e.g. student vs. teacher in teacher-based training)."""
+        tm = self.trainer.train_module
+        getter = getattr(tm, "num_flops_per_token_parts", None)
+        if getter is None:
+            return None
+        parts = getter(seq_len)
+        if not isinstance(parts, dict) or not parts:
+            return None
+        return parts
+
     def pre_train(self):
         self._first_step = True
 
@@ -172,3 +185,18 @@ class SpeedMonitorCallback(Callback):
             mfu_avg = 100 * num_flops_per_token * tps_avg / self.device_peak_flops
             self.trainer.record_metric("throughput/device/MFU", mfu)
             self.trainer.record_metric("throughput/device/MFU (actual avg)", mfu_avg)
+
+            # Per-model MFU (e.g. student vs. teacher in teacher-based
+            # training). The train module returns a dict of
+            # {name: flops_per_token}; each entry is logged as a
+            # separate metric so the individual contributions are
+            # visible alongside the combined MFU above.
+            parts = self._get_num_flops_per_token_parts(self._step_seq_len)
+            if parts is not None:
+                for name, part_flops in parts.items():
+                    mfu_part = 100 * part_flops * tps / self.device_peak_flops
+                    mfu_part_avg = 100 * part_flops * tps_avg / self.device_peak_flops
+                    self.trainer.record_metric(f"throughput/device/MFU ({name})", mfu_part)
+                    self.trainer.record_metric(
+                        f"throughput/device/MFU ({name} actual avg)", mfu_part_avg
+                    )

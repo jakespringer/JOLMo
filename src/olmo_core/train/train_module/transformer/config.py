@@ -25,6 +25,7 @@ from olmo_core.nn.transformer import (
     TransformerActivationCheckpointingMode,
     TransformerDataParallelWrappingStrategy,
 )
+from olmo_core.nn.peft import PEFTConfig
 from olmo_core.optim import OptimConfig
 from olmo_core.optim.scheduler import Scheduler
 
@@ -353,6 +354,18 @@ class TransformerTrainModuleConfig(Config):
     See :class:`TransformerEMAConfig`.
     """
 
+    # PEFT (parameter-efficient training) settings.
+
+    peft: Optional[PEFTConfig] = None
+    """
+    Optional config for parameter-efficient training. Supplies a list
+    of :class:`~olmo_core.nn.peft.ModelTransform` (LoRA, BitFit, etc.,
+    applied once before parallelization) and a list of
+    :class:`~olmo_core.nn.peft.GradientTransform` (random masking,
+    Fisher masking, etc., applied every step before the optimizer).
+    See :class:`~olmo_core.nn.peft.PEFTConfig`.
+    """
+
     # Checkpoint settings.
 
     state_dict_save_opts: Optional[Dict[str, Any]] = None
@@ -378,6 +391,10 @@ class TransformerTrainModuleConfig(Config):
         from .pipeline_train_module import TransformerPipelineTrainModule
         from .train_module import TransformerTrainModule
 
+        # Run PEFT compatibility checks before allocating anything.
+        if self.peft is not None:
+            self.peft.assert_compatible(self)
+
         kwargs = self.as_dict(exclude_none=True, recurse=False)
         if (autocast_precision := kwargs.pop("autocast_precision", None)) is not None:
             kwargs["autocast_precision"] = cast(DType, autocast_precision).as_pt()
@@ -390,6 +407,11 @@ class TransformerTrainModuleConfig(Config):
             if kwargs.pop("ema", None) is not None:
                 raise OLMoConfigurationError(
                     "Weight EMA is not currently supported with pipeline parallelism "
+                    "(TransformerPipelineTrainModule)."
+                )
+            if kwargs.pop("peft", None) is not None:
+                raise OLMoConfigurationError(
+                    "PEFT is not currently supported with pipeline parallelism "
                     "(TransformerPipelineTrainModule)."
                 )
             return TransformerPipelineTrainModule(

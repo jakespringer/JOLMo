@@ -833,7 +833,10 @@ class TransformerSAMTrainModule(TrainModule):
             )
 
     def eval_batch(
-        self, batch: Dict[str, Any], labels: Optional[torch.Tensor] = None
+        self,
+        batch: Dict[str, Any],
+        labels: Optional[torch.Tensor] = None,
+        return_logits: bool = True,
     ) -> Union[torch.Tensor, LMOutputWithLoss]:
         # TODO: (epwalsh) Currently all of our evaluators require the full logits locally,
         # but when we're using CP/TP we usually can't materialize the full logits locally (due to OOMs).
@@ -860,6 +863,7 @@ class TransformerSAMTrainModule(TrainModule):
                 labels=labels,
                 ignore_index=self.label_ignore_index,
                 loss_reduction="none",
+                return_logits=return_logits,
                 **model_kwargs,
             )
 

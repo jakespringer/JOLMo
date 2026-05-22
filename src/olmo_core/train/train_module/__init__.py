@@ -5,18 +5,25 @@ from .train_module import (
     TrainModule,
 )
 from .transformer import (
+    DistillConfig,
+    RepLossConfig,
+    TeacherModel,
+    TeacherModelConfig,
     TransformerActivationCheckpointingConfig,
     TransformerActivationCheckpointingMode,
     TransformerContextParallelConfig,
     TransformerDataParallelConfig,
     TransformerDataParallelWrappingStrategy,
+    TransformerDistillTrainModule,
     TransformerExpertParallelConfig,
     TransformerPipelineParallelConfig,
     TransformerPipelineTrainModule,
     TransformerPipelineTrainModuleConfig,
+    TransformerRepLossTrainModule,
     TransformerTensorParallelConfig,
     TransformerTrainModule,
     TransformerTrainModuleConfig,
+    kl_per_token,
 )
 
 __all__ = [
@@ -36,4 +43,11 @@ __all__ = [
     "TransformerTensorParallelConfig",
     "TransformerContextParallelConfig",
     "TransformerPipelineParallelConfig",
+    "TeacherModel",
+    "TeacherModelConfig",
+    "DistillConfig",
+    "TransformerDistillTrainModule",
+    "kl_per_token",
+    "RepLossConfig",
+    "TransformerRepLossTrainModule",
 ]

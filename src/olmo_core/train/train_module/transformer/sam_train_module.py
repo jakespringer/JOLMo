@@ -3,10 +3,9 @@ import logging
 import random
 from dataclasses import replace
 from functools import cached_property
-from typing import Any, Dict, Generator, Literal, Optional, Tuple, Union, Set, TYPE_CHECKING
+from typing import Any, Dict, Generator, Iterable, Literal, Optional, Tuple, Union, Set, TYPE_CHECKING
 from abc import ABCMeta, abstractmethod
-from dataclasses import dataclass
-from importlib import import_module
+from dataclasses import dataclass, fields as dataclass_fields
 from math import cos, pi
 
 import numpy as np
@@ -18,8 +17,17 @@ from torch.distributed import DeviceMesh
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.tensor import DTensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
+
+try:
+    # olmo_core's ``Transformer.apply_ddp`` uses the composable ``replicate()`` API,
+    # which does not wrap the model in a ``DistributedDataParallel`` instance — it
+    # swaps the model's class to a dynamically created subclass of this marker type.
+    from torch.distributed._composable.replicate import DDP as _ComposableDDP
+except ImportError:  # pragma: no cover - depends on torch version
+    _ComposableDDP = None
 
 from olmo_core.data.utils import get_labels, split_batch
 from olmo_core.distributed.checkpoint import (
@@ -135,6 +143,26 @@ def set_rng_state(state: Dict[str, Any]) -> None:
         torch.cuda.set_rng_state(saved_cuda_state, device=current_device)
 
 
+def _nested_placeholder_from_keys(keys: Iterable[str], prefix: str) -> Optional[Dict[str, Any]]:
+    """
+    Build a nested dict of ``None`` placeholders for every flattened checkpoint key under
+    ``prefix`` (e.g. ``"sam_scheduler.state.warmup"``), so that the checkpoint loader will
+    read those entries back. Returns ``None`` if the checkpoint has no such keys.
+    """
+    out: Optional[Dict[str, Any]] = None
+    for key in keys:
+        if not key.startswith(prefix + "."):
+            continue
+        if out is None:
+            out = {}
+        node = out
+        parts = key[len(prefix) + 1 :].split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = None
+    return out
+
+
 @dataclass
 class SAMScheduler(Config, metaclass=ABCMeta):
     """
@@ -151,8 +179,8 @@ class SAMScheduler(Config, metaclass=ABCMeta):
         if self.warmup is None and self.warmup_steps is not None:
             self.warmup = self.warmup_steps
             self.warmup_steps = None
-        if self.decay_alpha < 0:
-            raise OLMoConfigurationError("'decay_alpha' must be >= 0.")
+        if not (0.0 <= self.decay_alpha <= 1.0):
+            raise OLMoConfigurationError("'decay_alpha' must be in [0, 1].")
 
     @abstractmethod
     def get_rho(self, initial_rho: float, current: int, t_max: int) -> float:
@@ -173,11 +201,9 @@ class SAMScheduler(Config, metaclass=ABCMeta):
 
     # Serialization helpers for checkpoints.
     def as_state(self) -> Dict[str, Any]:
-        return {
-            "decay_alpha": self.decay_alpha,
-            "warmup": self.warmup,
-            "_initial_rho": self._initial_rho,
-        }
+        # Serialize every dataclass field (including subclass fields like
+        # SAMConstantScheduler.decay) so the schedule round-trips through checkpoints.
+        return {f.name: getattr(self, f.name) for f in dataclass_fields(self)}
 
     @classmethod
     def from_state(cls, state: Dict[str, Any]) -> "SAMScheduler":
@@ -205,6 +231,11 @@ class SAMConstantScheduler(SAMScheduler):
             raise OLMoConfigurationError("'decay' must be >= 0.")
 
     def get_rho(self, initial_rho: float, current: int, t_max: int) -> float:
+        # The warmup/decay helpers assert their min value is strictly below initial_rho,
+        # so short-circuit the degenerate cases (rho == 0, decay_alpha == 1).
+        if initial_rho <= 0:
+            return 0.0
+
         warmup = int(self.warmup or 0)
         # Warmup from 0 -> initial_rho
         if warmup > 0 and current <= warmup:
@@ -219,6 +250,8 @@ class SAMConstantScheduler(SAMScheduler):
         if current >= start_decay_at:
             # Linear decay to decay_alpha * initial_rho at step t_max
             eta_min = float(initial_rho * self.decay_alpha)
+            if eta_min >= initial_rho:
+                return float(initial_rho)
             step_from_end = max(t_max - current, 0)
             return float(_lr_linear_decay(initial_rho, step_from_end, decay, eta_min))
 
@@ -232,6 +265,9 @@ class SAMCosineScheduler(SAMScheduler):
     """
 
     def get_rho(self, initial_rho: float, current: int, t_max: int) -> float:
+        if initial_rho <= 0:
+            return 0.0
+
         warmup = int(self.warmup or 0)
         eta_min = float(initial_rho * self.decay_alpha)
 
@@ -318,6 +354,15 @@ class TransformerSAMTrainModule(TrainModule):
                 f"'max_sequence_length' ({max_sequence_length:,d} tokens)"
             )
 
+        # SAM perturbs local weights and reads local gradients directly, which is only
+        # correct when every rank holds full, plain-tensor parameters. Restrict to data
+        # parallelism until the DTensor (TP/CP/EP) cases are worked through.
+        if tp_config is not None or cp_config is not None or ep_config is not None:
+            raise OLMoConfigurationError(
+                "TransformerSAMTrainModule only supports data parallelism; "
+                "tensor/context/expert parallel configs are not supported."
+            )
+
         # Build world mesh.
         self.device = device or get_default_device()
         self.world_mesh: Optional[DeviceMesh] = None
@@ -391,7 +436,9 @@ class TransformerSAMTrainModule(TrainModule):
             flatten_optimizer_state_dict=True, strict=True
         )
         self.load_key_mapping = load_key_mapping
-        self.sam_config = sam_config or TransformerSAMConfig()
+        # Keep a private copy: pre_train() fills in 'm' and the rho scheduler mutates
+        # 'rho' in place, which shouldn't leak into the caller's config object.
+        self.sam_config = replace(sam_config) if sam_config is not None else TransformerSAMConfig()
         # Build allowed parameter set for SAM perturbation if filtering is requested.
         self._sam_allowed_param_ids: Optional[Set[int]] = self._build_sam_allowed_param_ids()
 
@@ -537,9 +584,16 @@ class TransformerSAMTrainModule(TrainModule):
                     load_opts = replace(load_opts, flatten_optimizer_state_dict=True)
 
         state_dict = self._get_state_dict(load_opts, optim=optim)
-        # Add placeholder for SAM scheduler if present in checkpoint.
-        if "sam_scheduler" in metadata.state_dict_metadata:
-            state_dict["sam_scheduler"] = {}
+        # The save planner flattens nested dicts, so the SAM scheduler appears in the
+        # checkpoint metadata as 'sam_scheduler.class', 'sam_scheduler.state.<field>', etc.
+        # Reconstruct a matching nested placeholder so the loader reads those entries back
+        # (an empty dict would create no read items and load nothing).
+        if self.sam_scheduler is not None:
+            sam_placeholder = _nested_placeholder_from_keys(
+                metadata.state_dict_metadata.keys(), prefix="sam_scheduler"
+            )
+            if sam_placeholder is not None:
+                state_dict["sam_scheduler"] = sam_placeholder
         if self.load_key_mapping is not None:
             swap_param_keys(state_dict, self.load_key_mapping, metadata=metadata)
 
@@ -588,22 +642,28 @@ class TransformerSAMTrainModule(TrainModule):
                 options=self.state_dict_load_opts,
             )
             gc_cuda()
-        # Load SAM scheduler if present
+        # Load SAM scheduler state if present. The configured scheduler always wins on
+        # which scheduler runs; the checkpoint only restores its internal state.
         sam_sd = state_dict.get("sam_scheduler", None)
         if isinstance(sam_sd, dict) and "class" in sam_sd and "state" in sam_sd:
-            try:
-                cls_path: str = sam_sd["class"]
-                mod_name, cls_name = cls_path.rsplit(".", 1)
-                mod = import_module(mod_name)
-                cls = getattr(mod, cls_name)
-                if isinstance(self.sam_scheduler, cls):
-                    # Update existing instance state
-                    for k, v in sam_sd["state"].items():
-                        setattr(self.sam_scheduler, k, v)
+            if self.sam_scheduler is None:
+                log.warning(
+                    "Checkpoint contains SAM scheduler state but no SAM scheduler is "
+                    "configured, ignoring it"
+                )
+            else:
+                cls = self.sam_scheduler.__class__
+                cls_path = f"{cls.__module__}.{cls.__name__}"
+                if sam_sd["class"] != cls_path:
+                    log.warning(
+                        f"Checkpoint SAM scheduler class ({sam_sd['class']}) does not match "
+                        f"the configured one ({cls_path}), keeping the configured scheduler's "
+                        "fresh state"
+                    )
                 else:
-                    self.sam_scheduler = cls.from_state(sam_sd["state"])
-            except Exception as e:
-                log.warning(f"Failed to load SAM scheduler from checkpoint ({e}), continuing without it")
+                    for k, v in sam_sd["state"].items():
+                        if hasattr(self.sam_scheduler, k):
+                            setattr(self.sam_scheduler, k, v)
 
     def train_batch(self, batch: Dict[str, Any], dry_run: bool = False):
         # Set model to train mode if it isn't already.
@@ -657,6 +717,14 @@ class TransformerSAMTrainModule(TrainModule):
         # m = per-GPU batch size (in tokens) for computing each perturbation.
         assert self.sam_config.m is not None, "sam_config.m must be set before train_batch (see pre_train)"
         sam_group_size = self.sam_config.m // self.rank_microbatch_size
+        if num_micro_batches % sam_group_size != 0:
+            raise RuntimeError(
+                f"Number of micro-batches ({num_micro_batches}) must be divisible by the SAM "
+                f"group size ({sam_group_size} micro-batches, m={self.sam_config.m:,d} tokens), "
+                "otherwise trailing micro-batches would be silently dropped. This can happen "
+                "when the global batch size changes mid-run (e.g. via a batch size scheduler) "
+                "to a value incompatible with 'sam_config.m'."
+            )
         num_sam_groups = num_micro_batches // sam_group_size
 
         # SAM algorithm (with optional m-sharding):
@@ -690,11 +758,13 @@ class TransformerSAMTrainModule(TrainModule):
             rng_state = get_rng_state()
 
             # --- ASCENT: accumulate gradients over this SAM group without DP sync ---
-            with self._sam_no_sync_context():
+            group_num_tokens_for_loss = move_to_device(torch.tensor(0.0), self.device)
+            with self._grad_sync_disabled():
                 for mb_idx in range(group_start, group_end):
                     input_ids, labels, model_kwargs = self._prepare_batch(
                         micro_batches[mb_idx], keep_keys=True
                     )
+                    group_num_tokens_for_loss += (labels != self.label_ignore_index).sum()
                     _, loss, ce_loss, _ = self.model_forward(
                         input_ids,
                         labels=labels,
@@ -714,6 +784,20 @@ class TransformerSAMTrainModule(TrainModule):
             if norm_mode == "global":
                 gnorm = self._grad_global_norm()
                 scale_global = (rho / (gnorm + self.sam_config.eps)).to(self.device)
+            # The ascent loss was divided by the full device batch's token count while the
+            # gradient only covers this group's tokens, so for the unnormalized mode rescale
+            # to make the perturbation rho times the group-mean gradient, independent of how
+            # many SAM groups the device batch is split into. The normalized modes cancel
+            # any scalar factor.
+            scale_unnormalized: torch.Tensor = rho
+            if norm_mode == "none":
+                scale_unnormalized = rho * (
+                    batch_num_tokens_for_loss / group_num_tokens_for_loss.clamp(min=1.0)
+                )
+            # Save original weights for an exact restore. Perturb-then-subtract leaves
+            # floating point rounding residue on every weight each step, which is
+            # significant for pure-bf16 parameters and would let DDP ranks slowly drift
+            # apart, since each rank perturbs differently and DDP never re-syncs weights.
             perturbations: list[Tuple[nn.Parameter, torch.Tensor]] = []
             for p in self.model.parameters():
                 if p.grad is None:
@@ -721,7 +805,7 @@ class TransformerSAMTrainModule(TrainModule):
                 if self._sam_allowed_param_ids is not None and id(p) not in self._sam_allowed_param_ids:
                     continue
                 if norm_mode == "none":
-                    scale_p = rho
+                    scale_p = scale_unnormalized
                 elif norm_mode == "layer":
                     p_norm = p.grad.detach().norm(2)
                     scale_p = (rho / (p_norm + self.sam_config.eps)).to(self.device)
@@ -730,8 +814,8 @@ class TransformerSAMTrainModule(TrainModule):
                 else:
                     raise OLMoConfigurationError(f"Invalid SAM normalization mode: {norm_mode}")
                 eps_w = p.grad.detach() * scale_p.to(dtype=p.dtype)
+                perturbations.append((p, p.data.clone()))
                 p.data.add_(eps_w)
-                perturbations.append((p, eps_w))
 
             # --- Restore accumulated descent grads (discard ascent grads) ---
             for p in self.model.parameters():
@@ -774,9 +858,9 @@ class TransformerSAMTrainModule(TrainModule):
 
                 descent_mb_counter += 1
 
-            # --- Restore original weights ---
-            for p, eps_w in perturbations:
-                p.data.sub_(eps_w)
+            # --- Restore original weights exactly ---
+            for p, original_data in perturbations:
+                p.data.copy_(original_data)
             del perturbations
 
         del batch  # In case this helps with memory utilization.
@@ -914,13 +998,11 @@ class TransformerSAMTrainModule(TrainModule):
     def _train_microbatch_context(
         self, micro_batch_idx: int, num_micro_batches: int
     ) -> Generator[None, None, None]:
+        # Only sync gradients on the final micro-batch of the device batch.
         is_last_mb = micro_batch_idx == num_micro_batches - 1
         with contextlib.ExitStack() as stack:
-            if isinstance(self.model, DDP):
-                # For DDP, only sync gradients on the final micro-batch.
-                if not is_last_mb:
-                    stack.enter_context(self.model.no_sync())
-
+            if not is_last_mb:
+                stack.enter_context(self._grad_sync_disabled())
             yield
 
     @contextlib.contextmanager
@@ -937,10 +1019,26 @@ class TransformerSAMTrainModule(TrainModule):
             yield
 
     @contextlib.contextmanager
-    def _sam_no_sync_context(self) -> Generator[None, None, None]:
+    def _grad_sync_disabled(self) -> Generator[None, None, None]:
+        """
+        Disable data-parallel gradient sync for forwards/backwards run within this context.
+
+        olmo_core's ``apply_ddp`` uses the composable ``replicate()`` API, which swaps the
+        model's class to a marker type that is NOT a ``DistributedDataParallel`` instance,
+        so an ``isinstance(self.model, DDP)`` check alone never matches and gradients would
+        be all-reduced on every backward — silently turning the per-rank (m-)SAM
+        perturbations into globally-averaged ones. The classic wrapper is still handled in
+        case it is ever used.
+        """
         if isinstance(self.model, DDP):
             with self.model.no_sync():
                 yield
+        elif _ComposableDDP is not None and isinstance(self.model, _ComposableDDP):
+            self.model.set_requires_gradient_sync(False)
+            try:
+                yield
+            finally:
+                self.model.set_requires_gradient_sync(True)
         else:
             yield
 
@@ -986,6 +1084,10 @@ class TransformerSAMTrainModule(TrainModule):
             grads, norm_type=norm_type, error_if_nonfinite=False, foreach=foreach
         )
 
+        # A DTensor norm has partial placements and must be reduced to get the true value.
+        if isinstance(total_norm, DTensor):
+            total_norm = total_norm.full_tensor()
+
         torch.nn.utils.clip_grads_with_norm_(parameters, max_grad_norm, total_norm, foreach=foreach)
         return total_norm
 
@@ -1005,6 +1107,8 @@ class TransformerSAMTrainModule(TrainModule):
         total_norm = nn.utils.get_total_norm(
             grads, norm_type=norm_type, error_if_nonfinite=False, foreach=foreach
         )
+        if isinstance(total_norm, DTensor):
+            total_norm = total_norm.full_tensor()
         return total_norm
 
     def _prepare_batch(

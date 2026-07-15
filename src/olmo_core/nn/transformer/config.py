@@ -278,6 +278,11 @@ class TransformerConfig(Config):
     init_std: float = 0.02
     freeze_params: Optional[List[str]] = None
     block_overrides: Optional[Dict[int, TransformerBlockConfig]] = None
+    tie_word_embeddings: bool = False
+    """
+    Share a single weight between the input token embedding and the output LM-head
+    projection (only supported by the default :class:`Transformer`).
+    """
 
     def build(
         self,
@@ -296,6 +301,12 @@ class TransformerConfig(Config):
             f"Building transformer with {self.num_params:,d} total params, "
             f"{self.num_non_embedding_params:,d} non-embedding params"
         )
+        if self.tie_word_embeddings and self.name != TransformerType.default:
+            raise OLMoConfigurationError(
+                "tie_word_embeddings is only supported by the default transformer type, "
+                f"not '{self.name}'"
+            )
+
         model: Transformer
         if self.name == TransformerType.default:
             model = Transformer(
@@ -310,6 +321,7 @@ class TransformerConfig(Config):
                 init_seed=self.init_seed,
                 init_std=self.init_std,
                 block_overrides=self.block_overrides,
+                tie_word_embeddings=self.tie_word_embeddings,
             )
         elif self.name == TransformerType.normalized:
             model = NormalizedTransformer(
@@ -386,6 +398,11 @@ class TransformerConfig(Config):
         # LM head.
         num_params += self.lm_head.num_params(self.d_model, self.vocab_size)
 
+        # Tied embeddings: the LM-head projection shares the embedding weight, so
+        # it is not counted as a separate parameter.
+        if self.tie_word_embeddings:
+            num_params -= self.d_model * self.vocab_size
+
         return num_params
 
     @property
@@ -411,6 +428,10 @@ class TransformerConfig(Config):
 
         # LM head.
         num_active_params += self.lm_head.num_params(self.d_model, self.vocab_size)
+
+        # Tied embeddings: the LM-head projection shares the embedding weight.
+        if self.tie_word_embeddings:
+            num_active_params -= self.d_model * self.vocab_size
 
         return num_active_params
 

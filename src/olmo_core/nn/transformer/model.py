@@ -97,6 +97,7 @@ class Transformer(nn.Module):
         init_seed: int = 0,
         init_std: float = 0.02,
         block_overrides: Optional[Dict[int, TransformerBlockConfig]] = None,
+        tie_word_embeddings: bool = False,
     ):
         super().__init__()
 
@@ -126,6 +127,21 @@ class Transformer(nn.Module):
         self.lm_head = lm_head.build(
             d_model=d_model, vocab_size=vocab_size, init_device=init_device
         )
+
+        # Optionally tie the input token embedding and the output (LM head)
+        # projection so they share a single ``vocab_size x d_model`` weight. The
+        # tie must be re-established at the end of ``init_weights`` because
+        # ``to_empty`` (and, under FSDP, per-module sharding) reallocate the
+        # parameter tensors and break the alias set up here. ``parameters()``
+        # de-duplicates shared tensors, so ``num_params`` counts the tied weight
+        # once automatically.
+        self.tie_word_embeddings = tie_word_embeddings
+        if self.tie_word_embeddings:
+            if self.embeddings is None or self.lm_head is None:
+                raise OLMoConfigurationError(
+                    "tie_word_embeddings requires both an embedding and an LM head"
+                )
+            self.lm_head.w_out.weight = self.embeddings.weight
 
         self.init_device = init_device
         self.init_method = InitMethod(init_method)
@@ -298,13 +314,20 @@ class Transformer(nn.Module):
             if max_seq_len is not None and att.rope is not None:
                 att.rope.warmup_cache(max_seq_len, device)
 
-        if self.lm_head is not None:
+        # When the LM head is tied to the embeddings, the shared weight is
+        # initialized by ``init_embeddings`` above; skip the separate w_out init.
+        if self.lm_head is not None and not self.tie_word_embeddings:
             self.init_method.init_final_w_out(
                 self.lm_head.w_out,
                 d_model=self.d_model,
                 std=self.init_std,
                 generator=generator,
             )
+
+        # Re-establish weight tying: ``to_empty`` (and FSDP sharding) above
+        # reallocated the parameter tensors, breaking the alias from ``__init__``.
+        if self.tie_word_embeddings and self.embeddings is not None and self.lm_head is not None:
+            self.lm_head.w_out.weight = self.embeddings.weight
 
         return generator
 
@@ -778,6 +801,11 @@ class Transformer(nn.Module):
         if (
             wrapping_strategy != TransformerDataParallelWrappingStrategy.blocks
             and self.lm_head is not None
+            # When tied, ``w_out.weight`` is the embedding weight, which is already
+            # owned by the embeddings FSDP group above; sharding the LM head as a
+            # separate group would try to manage the same tensor twice. Leave the
+            # head's remaining params (its norm) to the root ``fully_shard(self)``.
+            and not self.tie_word_embeddings
         ):
             fully_shard(self.lm_head, reshard_after_forward=False, **fsdp_config)
 

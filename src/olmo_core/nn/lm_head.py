@@ -25,6 +25,7 @@ from .functional import (
     cross_entropy_loss,
     fused_linear_cross_entropy_loss,
     l2_normalize,
+    polylog_cross_entropy_loss,
 )
 from .layer_norm import LayerNormConfig
 
@@ -73,6 +74,14 @@ class LMLossImplementation(StrEnum):
     with the loss computation.
     """
 
+    polylog = "polylog"
+    """
+    Polylogarithm cross entropy ``Li_s(1 - p_true)`` (``s = 1`` == ordinary CE), see
+    :func:`~olmo_core.nn.functional.polylog_cross_entropy_loss`. Materializes the full
+    logits like ``default``. The ``ce_loss`` output remains the true cross entropy
+    (for logging/eval); only the optimized ``loss`` is the polylog objective.
+    """
+
 
 @dataclass
 class LMHeadConfig(Config):
@@ -90,6 +99,16 @@ class LMHeadConfig(Config):
     bias: Optional[bool] = None
     dtype: DType = DType.float32
     loss_implementation: LMLossImplementation = LMLossImplementation.default
+    polylog_s: Optional[float] = None
+    """
+    The polylog order for the ``polylog`` loss implementation, in ``(0, 0.99]`` or exactly
+    ``1.0`` (== ordinary CE). Required when ``loss_implementation`` is ``polylog``.
+    """
+    polylog_p_min: Optional[float] = None
+    """
+    Clamp on the true-class probability for the ``polylog`` loss (default ``1e-6``), bounding
+    the ``p^(s-1)`` blowup of the loss and gradient weight. Choose jointly with ``polylog_s``.
+    """
 
     def num_params(self, d_model: int, vocab_size: int) -> int:
         """
@@ -118,6 +137,25 @@ class LMHeadConfig(Config):
         :param d_model: The model dimensionality.
         :param init_device: The device initialize the parameters on, e.g. "cpu", "meta".
         """
+        if self.loss_implementation == LMLossImplementation.polylog:
+            if self.polylog_s is None:
+                raise OLMoConfigurationError(
+                    "'polylog_s' is required with the 'polylog' loss implementation"
+                )
+            if not (0.0 < self.polylog_s <= 1.0) or (0.99 < self.polylog_s < 1.0):
+                raise OLMoConfigurationError(
+                    "'polylog_s' must be in (0, 0.99] or exactly 1.0 "
+                    f"(the expansion has a pole at 1), got {self.polylog_s}"
+                )
+            if self.name == LMHeadType.normalized:
+                raise OLMoConfigurationError(
+                    "the 'polylog' loss implementation is not supported by the normalized LM head"
+                )
+        elif self.polylog_s is not None or self.polylog_p_min is not None:
+            raise OLMoConfigurationError(
+                "'polylog_s'/'polylog_p_min' are only valid with the 'polylog' loss implementation"
+            )
+
         kwargs = self.as_dict(exclude_none=True, recurse=False)
         kwargs.pop("name")
         kwargs.update(
@@ -166,6 +204,8 @@ class LMHead(nn.Module):
         bias: bool = True,
         init_device: str = "cpu",
         loss_implementation: LMLossImplementation = LMLossImplementation.default,
+        polylog_s: Optional[float] = None,
+        polylog_p_min: Optional[float] = None,
     ):
         super().__init__()
         self.norm = (
@@ -175,6 +215,8 @@ class LMHead(nn.Module):
         self._d_model = d_model
         self._vocab_size = vocab_size
         self._loss_implementation = loss_implementation
+        self._polylog_s = polylog_s
+        self._polylog_p_min = polylog_p_min
         self._tp_mesh: Optional[DeviceMesh] = None
         self._cp_mesh: Optional[DeviceMesh] = None
 
@@ -264,6 +306,22 @@ class LMHead(nn.Module):
                 loss = ce_loss + z_loss
             else:
                 loss = ce_loss
+        elif self.loss_implementation == LMLossImplementation.polylog:
+            assert self._polylog_s is not None
+            logits = self.w_out(h)
+            assert logits is not None
+            loss, z_loss, ce_loss = polylog_cross_entropy_loss(
+                get_local_tensor(logits).view(-1, self.vocab_size),
+                get_local_tensor(labels).contiguous().view(-1),
+                s=self._polylog_s,
+                p_min=self._polylog_p_min if self._polylog_p_min is not None else 1e-6,
+                ignore_index=ignore_index,
+                reduction=loss_reduction,
+                compute_z_loss=z_loss_multiplier is not None,
+                z_loss_multiplier=z_loss_multiplier or 1e-4,
+            )
+            if z_loss is not None:
+                loss = loss + z_loss
         elif self.loss_implementation == LMLossImplementation.fused_linear:
             logits = None
             loss, z_loss = fused_linear_cross_entropy_loss(

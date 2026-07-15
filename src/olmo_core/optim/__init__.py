@@ -14,6 +14,7 @@ from .sophia import Sophia, SophiaConfig
 from .scheduler import (
     WSD,
     WSDS,
+    AlphaInvSqrtWithWarmup,
     ConstantScheduler,
     ConstantWithWarmup,
     CosWithWarmup,
@@ -63,6 +64,7 @@ __all__ = [
     "CosWithWarmup",
     "HalfCosWithWarmup",
     "InvSqrtWithWarmup",
+    "AlphaInvSqrtWithWarmup",
     "LinearWithWarmup",
     "SequentialScheduler",
     "WSD",

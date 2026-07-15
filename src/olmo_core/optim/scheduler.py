@@ -319,6 +319,66 @@ class InvSqrtWithWarmup(Scheduler):
 
 
 @dataclass
+class AlphaInvSqrtWithWarmup(Scheduler):
+    """
+    Inverse square root LR schedule with a warmup and an independent decay timescale.
+
+    After the warmup the multiplier is ``sqrt(alpha / (alpha + s))`` where
+    ``s = current - warmup`` is the number of steps since warmup ended, so it is
+    ``1`` (peak) at the end of warmup (continuous) and asymptotes to ``~sqrt(alpha/s)``.
+    Unlike :class:`InvSqrtWithWarmup` (whose decay timescale is tied to ``warmup``),
+    the timescale here is the separate hyperparameter ``alpha`` — larger ``alpha``
+    decays more slowly. The schedule is independent of ``t_max`` (horizon-free), which
+    makes it suitable for early-stopped runs of unknown length.
+    """
+
+    alpha: float = 1000.0
+    """The decay timescale, in steps."""
+
+    alpha_f: float = 0.0
+    warmup: Optional[int] = None
+    warmup_steps: Optional[int] = None  # deprecated, use 'warmup' instead.
+    warmup_fraction: Optional[float] = None
+    warmup_min_lr: float = 0.0
+
+    def __post_init__(self):
+        if self.warmup is None and self.warmup_steps is not None:
+            self.warmup = self.warmup_steps
+            self.warmup_steps = None
+            warnings.warn(
+                f"'{self.__class__.__name__}.warmup_steps' is deprecated, please use '.warmup' instead.",
+                DeprecationWarning,
+            )
+
+        if (self.warmup_fraction is None) == (self.warmup is None):
+            raise OLMoConfigurationError("Either 'warmup_fraction' or 'warmup' must be specified.")
+
+        if self.warmup_fraction is not None and (
+            self.warmup_fraction < 0 or self.warmup_fraction > 1
+        ):
+            raise OLMoConfigurationError("'warmup_fraction' must be between 0 and 1.")
+
+        if self.alpha <= 0:
+            raise OLMoConfigurationError("'alpha' must be positive.")
+
+    def get_lr(
+        self, initial_lr: Union[float, torch.Tensor], current: int, t_max: int
+    ) -> Union[float, torch.Tensor]:
+        if self.warmup is None:
+            assert self.warmup_fraction is not None
+            warmup = round(t_max * self.warmup_fraction)
+        else:
+            warmup = self.warmup
+
+        if current < warmup:
+            return _linear_warmup(initial_lr, current, warmup, self.warmup_min_lr)
+
+        eta_min = initial_lr * self.alpha_f
+        s = current - warmup
+        return eta_min + (initial_lr - eta_min) * sqrt(self.alpha / (self.alpha + s))
+
+
+@dataclass
 class CosWithWarmup(Scheduler):
     """
     Cosine learning rate schedule with a warmup.

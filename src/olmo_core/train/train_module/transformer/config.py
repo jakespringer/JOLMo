@@ -484,6 +484,8 @@ class TransformerSAMConfig(Config):
     """
 
     def __post_init__(self):
+        if self.rho < 0:
+            raise OLMoConfigurationError("'rho' must be >= 0.")
         if self.normalization not in {"none", "global", "layer"}:
             raise OLMoConfigurationError(
                 f"Invalid SAM normalization '{self.normalization}'. Expected one of: 'none', 'global', 'layer'"

@@ -9,6 +9,7 @@ from .checkpointer import CheckpointerCallback, CheckpointRemovalStrategy
 from .comet import CometCallback, CometNotificationSetting
 from .config_saver import ConfigSaverCallback
 from .console_logger import ConsoleLoggerCallback
+from .early_stopping import EarlyStoppingCallback
 from .ema_checkpointer import EMACheckpointerCallback, EMASaveMode
 from .ema_evaluator_callback import EMAEvaluatorCallback
 from .evaluator_callback import (
@@ -37,6 +38,7 @@ __all__ = [
     "CometNotificationSetting",
     "ConfigSaverCallback",
     "ConsoleLoggerCallback",
+    "EarlyStoppingCallback",
     "EvaluatorCallback",
     "LMEvaluatorCallbackConfig",
     "DownstreamEvaluatorCallbackConfig",

@@ -10,6 +10,7 @@ from .comet import CometCallback, CometNotificationSetting
 from .config_saver import ConfigSaverCallback
 from .console_logger import ConsoleLoggerCallback
 from .early_stopping import EarlyStoppingCallback
+from .threshold_abort import ThresholdAbortCallback
 from .ema_checkpointer import EMACheckpointerCallback, EMASaveMode
 from .ema_evaluator_callback import EMAEvaluatorCallback
 from .evaluator_callback import (
@@ -20,6 +21,7 @@ from .evaluator_callback import (
 from .garbage_collector import GarbageCollectorCallback
 from .gpu_memory_monitor import GPUMemoryMonitorCallback
 from .list_checkpointer import ListCheckpointerCallback
+from .metrics_jsonl import MetricsJsonlCallback
 from .monkey_patcher import MonkeyPatcherCallback
 from .peft_gradient import PEFTGradientCallback
 from .profiler import ProfilerCallback
@@ -39,6 +41,7 @@ __all__ = [
     "ConfigSaverCallback",
     "ConsoleLoggerCallback",
     "EarlyStoppingCallback",
+    "ThresholdAbortCallback",
     "EvaluatorCallback",
     "LMEvaluatorCallbackConfig",
     "DownstreamEvaluatorCallbackConfig",
@@ -52,6 +55,7 @@ __all__ = [
     "SlackNotificationSetting",
     "SequenceLengthSchedulerCallback",
     "SpeedMonitorCallback",
+    "MetricsJsonlCallback",
     "WandBCallback",
     "BeakerCallback",
     "BatchSizeSchedulerCallback",

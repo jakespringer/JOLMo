@@ -2,7 +2,7 @@
 
 How distributed is initialized
 
-```85:139:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/train/__init__.py
+```85:139:src/olmo_core/train/__init__.py
 def prepare_training_environment(
     *,
     seed: Optional[int] = None,
@@ -27,7 +27,7 @@ def prepare_training_environment(
 
 How data/tensor/context parallel is applied to the model
 
-```116:145:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/train/train_module/transformer/common.py
+```116:145:src/olmo_core/train/train_module/transformer/common.py
     # Maybe shard/replicate according to data parallel config.
     if dp_config is not None:
         assert world_mesh is not None
@@ -62,7 +62,7 @@ Quick start: torchrun
 
 Recommended parallel configs (from the full guide)
 
-```298:336:/usr0/home/jspringe/projects/JOLMo/docs/source/guides/all_in_one_for_researchers.md
+```298:336:docs/source/guides/all_in_one_for_researchers.md
 ### Guidelines
 ...
 - For models with 1B or more parameters you should use FSDP instead of DDP.
@@ -98,7 +98,7 @@ Minimal efficiency checklist
 
 Setting dp_config in a script (example)
 
-```177:190:/usr0/home/jspringe/projects/JOLMo/src/examples/llm/train.py
+```177:190:src/examples/llm/train.py
     train_module_config = TransformerTrainModuleConfig(
         rank_microbatch_size=16 * 1024,  # NOTE: this is specified in tokens, not instances
         max_sequence_length=opts.sequence_length,

@@ -4,7 +4,7 @@ How configs are passed
 - Training scripts in this repo build an `ExperimentConfig` (model, data, train module, trainer) and accept CLI overrides in dot-notation.
 - Typical entry point uses `olmo_core.script_utils.main`, which parses a few standard flags and forwards overrides to your builder.
 
-```38:85:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/script_utils.py
+```38:85:src/olmo_core/script_utils.py
 def get_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=sys.argv[0],
@@ -22,7 +22,7 @@ def get_cli_parser() -> argparse.ArgumentParser:
 
 What the main runner does
 
-```101:146:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/script_utils.py
+```101:146:src/olmo_core/script_utils.py
 def main(
     config_builder: Callable[[argparse.Namespace, List[str]], ExperimentConfig],
     parser: Optional[argparse.ArgumentParser] = None,
@@ -50,7 +50,7 @@ Launching
 
 Example: building a minimal config in a script
 
-```142:193:/usr0/home/jspringe/projects/JOLMo/src/examples/llm/train.py
+```142:193:src/examples/llm/train.py
 def build_config(opts, overrides: List[str]) -> ExperimentConfig:
     ...
     tokenizer_config = TokenizerConfig.gpt2()
@@ -87,7 +87,7 @@ Expected run directory structure
 - You specify one `save_folder` for the run (local path or remote URL like `s3://...` or `gs://...`).
 - Checkpoints are saved as subdirectories named by step, plus a small metadata file.
 
-```891:905:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/train/trainer.py
+```891:905:src/olmo_core/train/trainer.py
     def save_checkpoint(self) -> PathOrStr:
         """
         Save a checkpoint for the current step to the :data:`save_folder`.

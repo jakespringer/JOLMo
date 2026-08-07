@@ -59,3 +59,6 @@ site/
 /scratch/
 core
 /dataset-cache/
+
+# Local agent config (machine-specific permission paths)
+.claude/

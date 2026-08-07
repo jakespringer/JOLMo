@@ -4,7 +4,7 @@ This codebase builds optimizers from config objects and wires them into the trai
 
 - The train module constructs the optimizer from your config:
 
-```191:195:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/train/train_module/transformer/train_module.py
+```191:195:src/olmo_core/train/train_module/transformer/train_module.py
         # Build optimizer(s).
         log.info("Building optimizer...")
         self.optim: Optimizer = optim.build(self.model, strict=True)
@@ -12,7 +12,7 @@ This codebase builds optimizers from config objects and wires them into the trai
 
 - Optimizers are specified via `OptimConfig` subclasses:
 
-```41:79:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/optim/config.py
+```41:79:src/olmo_core/optim/config.py
 @dataclass
 class OptimConfig(Config, Generic[Opt], metaclass=ABCMeta):
     """
@@ -32,7 +32,7 @@ class OptimConfig(Config, Generic[Opt], metaclass=ABCMeta):
 
 - Example: built-in AdamW config:
 
-```233:249:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/optim/adam.py
+```233:249:src/olmo_core/optim/adam.py
 @dataclass
 class AdamWConfig(OptimConfig):  # NOTE: omagaconf doesn't like "OptimConfig[torch.optim.AdamW]"
     """
@@ -58,7 +58,7 @@ Using group overrides and compilation
 - You can create param groups by name patterns with `OptimGroupOverride`, e.g., to set `weight_decay=0` for embeddings.
 - Setting `compile=True` on your `OptimConfig` compiles `optim.step()` (experimental).
 
-```174:225:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/optim/config.py
+```174:225:src/olmo_core/optim/config.py
         optim: torch.optim.Optimizer = self.optimizer()(
             self.build_groups(model, strict=strict), **kwargs
         )
@@ -150,7 +150,7 @@ class SAMCallback(Callback):
 
 Wire the callback into a run:
 
-```12:35:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/train/config.py
+```12:35:src/olmo_core/train/config.py
 @dataclass
 class TrainerConfig(Config):
     ...

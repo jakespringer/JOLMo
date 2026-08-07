@@ -10,14 +10,14 @@ Why precompute?
 Key integration points
 - Datasets and data loaders:
 
-```44:66:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/data/data_loader.py
+```44:66:src/olmo_core/data/data_loader.py
 class DataLoaderBase(ABC):
     """
     An abstract base class for data loaders used by the :class:`~olmo_core.train.Trainer`.
     ...
 ```
 
-```307:323:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/data/data_loader.py
+```307:323:src/olmo_core/data/data_loader.py
 class NumpyDataLoaderBase(TextDataLoaderBase):
     """
     A distributed, deterministic, stateful data loader base class for use with
@@ -25,7 +25,7 @@ class NumpyDataLoaderBase(TextDataLoaderBase):
     """
 ```
 
-```1115:1130:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/data/data_loader.py
+```1115:1130:src/olmo_core/data/data_loader.py
         data_loader = NumpyDataLoaderBase.wrap_numpy_dataset(
             dataset,
             global_batch_size=self.global_batch_size,
@@ -56,7 +56,7 @@ Minimal pipeline sketch (Spark)
 Notes
 - DType must match the dataset dtype. If unspecified, the dataset picks it from vocab size:
 
-```2372:2386:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/data/numpy_dataset.py
+```2372:2386:src/olmo_core/data/numpy_dataset.py
     def get_dtype(self) -> NumpyUIntTypes:
         if self.dtype is not None:
             return NumpyDatasetDType(self.dtype).as_np_dtype()
@@ -72,7 +72,7 @@ Notes
 
 Sample config (fixed sequence length)
 
-```142:176:/usr0/home/jspringe/projects/JOLMo/src/examples/llm/train.py
+```142:176:src/examples/llm/train.py
 def build_config(opts, overrides: List[str]) -> ExperimentConfig:
     tokenizer_config = TokenizerConfig.gpt2()
     ...
@@ -92,7 +92,7 @@ def build_config(opts, overrides: List[str]) -> ExperimentConfig:
 Collation and batching
 - The provided `DataCollator` pads/truncates and builds masks:
 
-```24:31:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/data/collator.py
+```24:31:src/olmo_core/data/collator.py
 @dataclass
 class DataCollator:
     """
@@ -118,7 +118,7 @@ Only do this if you cannot precompute. You’ll need to implement a subclass of 
 
 Required methods (for a `DataLoaderBase` subclass)
 
-```148:168:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/data/data_loader.py
+```148:168:src/olmo_core/data/data_loader.py
     @property
     @abstractmethod
     def total_batches(self) -> Optional[int]:
@@ -146,7 +146,7 @@ Guidelines for a Spark-backed loader
 Reference logic to emulate
 - DP/worker slicing and batching:
 
-```697:725:/usr0/home/jspringe/projects/JOLMo/src/olmo_core/data/data_loader.py
+```697:725:src/olmo_core/data/data_loader.py
     def _get_local_instance_indices(self, indices: np.ndarray) -> Iterable[int]:
         ...
         # Slice batches by data loader worker rank ...
